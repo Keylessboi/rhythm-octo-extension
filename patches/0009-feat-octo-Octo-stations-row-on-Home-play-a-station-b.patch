@@ -1,0 +1,171 @@
+From 2664490974cb622bb6d0dc99ad7c2c23448cb1a7 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 06:07:22 -0500
+Subject: [PATCH 09/12] feat(octo): Octo stations row on Home; play a station
+ by fetching its songs
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../local/presentation/screens/HomeScreen.kt  |  1 +
+ .../rhythm/app/features/octo/OctoStations.kt  | 60 +++++++++++++++++++
+ .../StreamingMusicRepositoryImpl.kt           |  1 +
+ .../domain/model/StreamingPlaylist.kt         |  2 +
+ .../viewmodel/StreamingMusicViewModel.kt      |  3 +-
+ .../app/features/octo/OctoStationsTest.kt     | 27 +++++++++
+ 6 files changed, 93 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+index e6c01a83..90b0a35a 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+@@ -990,6 +990,7 @@ private fun StreamingHomeBody(
+         chromahub.rhythm.app.offline.OfflineDownloadsCard(streamingConfigured = hasConfiguredSession || hasOfflineContent)
+         // Fork (Octo): what the Octo server is fetching for the user (features/octo); draws nothing elsewhere
+         if (hasConfiguredSession) chromahub.rhythm.app.features.octo.OctoRequestsCard(modifier = Modifier.padding(top = 12.dp))
++        if (hasConfiguredSession && streamingViewModel != null) chromahub.rhythm.app.features.octo.OctoStationsRow(streamingViewModel, Modifier.padding(top = 12.dp))
+ 
+         val isTablet = widthSizeClass != WindowWidthSizeClass.Compact || windowScreenWidthDp() >= 600
+         val isLandscapeTablet = isTablet && windowScreenWidthDp() > windowScreenHeightDp()
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+new file mode 100644
+index 00000000..89c6d65a
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingPlaylist
++import chromahub.rhythm.app.features.streaming.presentation.viewmodel.StreamingMusicViewModel
++
++/** Fork (Octo): which playlists are Octo's stations, and in what order they are offered. */
++object OctoStations {
++    private val first = listOf("Starter Radio", "Your Mix", "Discovery Mix")
++
++    fun of(playlists: List<StreamingPlaylist>): List<StreamingPlaylist> =
++        playlists.filter { it.isOctoRadio && it.songCount > 0 }
++            .sortedWith(compareBy({ first.indexOf(it.name).let { i -> if (i < 0) first.size else i } }, { it.name.lowercase() }))
++}
++
++/** A row of Octo's stations; a tap plays one. Draws nothing when the server has none (or is not Octo). */
++@Composable
++fun OctoStationsRow(viewModel: StreamingMusicViewModel, modifier: Modifier = Modifier) {
++    val playlists by viewModel.savedPlaylists.collectAsState()
++    val stations = remember(playlists) { OctoStations.of(playlists) }
++    if (stations.isEmpty()) return
++    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text("Octo stations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++            items(stations, key = { it.id }) { station ->
++                Card(
++                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
++                    shape = RoundedCornerShape(18.dp),
++                    modifier = Modifier.clickable { viewModel.playPlaylist(station) },
++                ) {
++                    Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
++                        Text(station.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                        Text("${station.songCount} songs", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+index d3e12bdb..c87d4b44 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+@@ -2565,6 +2565,7 @@ class StreamingMusicRepositoryImpl(
+             isCollaborative = false,
+             followers = null,
+             snapshotId = null,
++            isOctoRadio = providerPlaylist.isOctoRadio,
+             tracks = resolvedTracks
+         )
+     }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingPlaylist.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingPlaylist.kt
+index 0e2108e6..ac88caff 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingPlaylist.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingPlaylist.kt
+@@ -26,6 +26,8 @@ data class StreamingPlaylist(
+     val isCollaborative: Boolean = false,
+     val followers: Long? = null,
+     val snapshotId: String? = null, // For Spotify change tracking
++    /** Fork (Octo): one of Octo's generated radio stations (a read-only playlist that rotates). */
++    val isOctoRadio: Boolean = false,
+     private val tracks: List<StreamingSong> = emptyList()
+ ) : PlaylistItem {
+     
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+index 506af92c..0b590005 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+@@ -1286,7 +1286,8 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+      */
+     fun playPlaylist(playlist: StreamingPlaylist) {
+         viewModelScope.launch {
+-            val tracks = playlist.getTracks()
++            // Fork: server playlists arrive without their songs (Octo stations); fetch them on demand.
++            val tracks = playlist.getTracks().ifEmpty { repository.fetchPlaylistSongsForPins(playlist.id).getOrNull().orEmpty() }
+             if (tracks.isNotEmpty()) {
+                 playQueue(tracks, startIndex = 0, shuffle = false)
+             }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
+new file mode 100644
+index 00000000..1d163045
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import chromahub.rhythm.app.core.domain.model.SourceType
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingPlaylist
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class OctoStationsTest {
++    private fun p(name: String, octo: Boolean = true, count: Int = 10) = StreamingPlaylist(
++        id = name, name = name, description = null, artworkUri = null, songCount = count,
++        isEditable = false, sourceType = SourceType.SUBSONIC, isOctoRadio = octo,
++    )
++
++    @Test
++    fun onlyOctoStationsWithSongsAreOffered() {
++        val r = OctoStations.of(listOf(p("Gym", octo = false), p("Trap Radio"), p("Empty Radio", count = 0)))
++        assertEquals(listOf("Trap Radio"), r.map { it.name })
++    }
++
++    @Test
++    fun yourMixAndDiscoveryComeBeforeTheArtistRadios() {
++        val r = OctoStations.of(listOf(p("OutKast Radio"), p("Discovery Mix"), p("Your Mix"), p("Trap Radio")))
++        assertEquals(listOf("Your Mix", "Discovery Mix", "OutKast Radio", "Trap Radio"), r.map { it.name })
++    }
++}
+-- 
+2.56.0
+

@@ -1,0 +1,98 @@
+From 67d7c2417b05cf45f52db90906032cc9cdb4b0ea Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 06:48:33 -0500
+Subject: [PATCH 11/12] feat(octo): label search hits Octo only previews as Not
+ in library
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../rhythm/app/features/octo/OctoSearchLabel.kt  | 11 +++++++++++
+ .../screens/UniversalSearchScreen.kt             |  5 +++--
+ app/src/main/res/values/strings.xml              |  1 +
+ .../app/features/octo/OctoSearchLabelTest.kt     | 16 ++++++++++++++++
+ 4 files changed, 31 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
+new file mode 100644
+index 00000000..953be439
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
+@@ -0,0 +1,11 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++/** Fork (Octo): a search hit Octo only previews says so, instead of looking like part of the library. */
++object OctoSearchLabel {
++    fun subtitle(artist: String, album: String, isExternal: Boolean, notInLibrary: String): String {
++        val base = "$artist • $album"
++        return if (isExternal) "$base • $notInLibrary" else base
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/shared/presentation/screens/UniversalSearchScreen.kt b/app/src/main/java/chromahub/rhythm/app/shared/presentation/screens/UniversalSearchScreen.kt
+index 5c27b18d..790e7565 100644
+--- a/app/src/main/java/chromahub/rhythm/app/shared/presentation/screens/UniversalSearchScreen.kt
++++ b/app/src/main/java/chromahub/rhythm/app/shared/presentation/screens/UniversalSearchScreen.kt
+@@ -218,6 +218,7 @@ fun UniversalSearchScreen(
+     val searchHistory by localViewModel.searchHistory.collectAsState()
+     val favoriteSongs by localViewModel.favoriteSongs.collectAsState()
+ 
++    val notInLibraryLabel = stringResource(R.string.octo_not_in_library)
+     val streamingQuery by streamingViewModel.searchQuery.collectAsState()
+     val streamingResults by streamingViewModel.searchResults.collectAsState()
+     val isStreamingLoading by streamingViewModel.isLoading.collectAsState()
+@@ -713,7 +714,7 @@ fun UniversalSearchScreen(
+                                         })
+                                     }
+                                     matchedStreamingSongs.take(3).forEach { song ->
+-                                        add(SongSearchItem("STREAMING", song.title, "${song.artist} • ${song.album}", song.artworkUri, song) {
++                                        add(SongSearchItem("STREAMING", song.title, chromahub.rhythm.app.features.octo.OctoSearchLabel.subtitle(song.artist, song.album, song.isExternal, notInLibraryLabel), song.artworkUri, song) {
+                                             if (query.isNotBlank()) localViewModel.addSearchQuery(query)
+                                             handleAction("STREAMING") { onStreamingSongClick(song) }
+                                         })
+@@ -961,7 +962,7 @@ fun UniversalSearchScreen(
+                                     })
+                                 }
+                                 matchedStreamingSongs.take(3).forEach { song ->
+-                                    add(SongSearchItem("STREAMING", song.title, "${song.artist} • ${song.album}", song.artworkUri, song) {
++                                    add(SongSearchItem("STREAMING", song.title, chromahub.rhythm.app.features.octo.OctoSearchLabel.subtitle(song.artist, song.album, song.isExternal, notInLibraryLabel), song.artworkUri, song) {
+                                         if (query.isNotBlank()) localViewModel.addSearchQuery(query)
+                                         handleAction("STREAMING") { onStreamingSongClick(song) }
+                                     })
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c1cc6300..a1690ddd 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3096,4 +3096,5 @@
+     <string name="offline_eta_h">%1$d h</string>
+     <string name="offline_eta_h_min">%1$d h %2$d min</string>
+     <string name="offline_search_hint">Offline: results are limited to downloaded songs</string>
++    <string name="octo_not_in_library">Not in library</string>
+ </resources>
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
+new file mode 100644
+index 00000000..12b2b458
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
+@@ -0,0 +1,16 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class OctoSearchLabelTest {
++    @Test
++    fun aPreviewIsLabelledNotInLibrary() =
++        assertEquals("Kanye West • Graduation • Not in library", OctoSearchLabel.subtitle("Kanye West", "Graduation", true, "Not in library"))
++
++    @Test
++    fun anOwnedSongKeepsItsPlainSubtitle() =
++        assertEquals("Kanye West • Graduation", OctoSearchLabel.subtitle("Kanye West", "Graduation", false, "Not in library"))
++}
+-- 
+2.56.0
+

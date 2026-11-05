@@ -1,0 +1,349 @@
+From 441fcdfd3085a45f9ea9cf379ae89561e0864803 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 05:43:17 -0500
+Subject: [PATCH 08/12] feat(octo): start radio from a song; never cache the
+ server's placeholder cover
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../chromahub/rhythm/app/RhythmApplication.kt |  1 +
+ .../navigation/LocalNavigation.kt             |  1 +
+ .../presentation/screens/LibraryScreen.kt     | 20 ++++--
+ .../rhythm/app/features/octo/RadioQueue.kt    | 11 ++++
+ .../viewmodel/StreamingMusicViewModel.kt      | 13 ++++
+ .../bottomsheets/SongOverflowBottomSheet.kt   | 13 +++-
+ .../app/util/coil/CoverPlaceholderGuard.kt    | 65 +++++++++++++++++++
+ .../app/features/octo/RadioQueueTest.kt       | 23 +++++++
+ .../util/coil/CoverPlaceholderGuardTest.kt    | 34 ++++++++++
+ 9 files changed, 174 insertions(+), 7 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/RadioQueue.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuard.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/RadioQueueTest.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuardTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/RhythmApplication.kt b/app/src/main/java/chromahub/rhythm/app/RhythmApplication.kt
+index 078e5c6b..c6c7df0a 100644
+--- a/app/src/main/java/chromahub/rhythm/app/RhythmApplication.kt
++++ b/app/src/main/java/chromahub/rhythm/app/RhythmApplication.kt
+@@ -149,6 +149,7 @@ class RhythmApplication : Application(), ImageLoaderFactory {
+                 maxRequests = 16
+                 maxRequestsPerHost = 4
+             })
++            .addInterceptor(chromahub.rhythm.app.util.coil.CoverPlaceholderInterceptor()) // Fork: never cache the server's placeholder cover
+             .build()
+ 
+         return ImageLoader.Builder(this)
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/navigation/LocalNavigation.kt b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/navigation/LocalNavigation.kt
+index ee14ffbf..5d924c5f 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/navigation/LocalNavigation.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/navigation/LocalNavigation.kt
+@@ -3669,6 +3669,7 @@ private fun LocalNavigationContent(
+                         streamingFavoriteSongIds = streamingLikedSongIds,
+                         streamingDownloadedSongIds = streamingDownloadedSongIds,
+                         streamingDownloadingSongIds = streamingDownloadingSongIds,
++                        onStartRadio = if (isStreamingMode) ({ song -> streamingMusicViewModel.startRadio(song.id) }) else null,
+                         onStreamingToggleDownload = if (isStreamingMode) ({ song ->
+                             if (streamingDownloadedSongIds.contains(song.id)) {
+                                 streamingMusicViewModel.removeDownload(song.id)
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/LibraryScreen.kt b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/LibraryScreen.kt
+index 8b63d3eb..b0fdd5a4 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/LibraryScreen.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/LibraryScreen.kt
+@@ -357,7 +357,8 @@ fun LibraryScreen(
+     streamingFavoriteSongIds: Set<String> = emptySet(),
+     streamingDownloadedSongIds: Set<String> = emptySet(),
+     streamingDownloadingSongIds: Set<String> = emptySet(),
+-    onStreamingToggleDownload: ((Song) -> Unit)? = null
++    onStreamingToggleDownload: ((Song) -> Unit)? = null,
++    onStartRadio: ((Song) -> Unit)? = null
+ ) {
+     val context = LocalContext.current
+     val appSettings = remember { AppSettings.getInstance(context) }
+@@ -1712,7 +1713,8 @@ fun LibraryScreen(
+                                             isStreamingMode = isStreamingMode,
+                                             streamingDownloadedSongIds = streamingDownloadedSongIds,
+                                             streamingDownloadingSongIds = streamingDownloadingSongIds,
+-                                            onStreamingToggleDownload = onStreamingToggleDownload
++                                            onStreamingToggleDownload = onStreamingToggleDownload,
++                                            onStartRadio = onStartRadio
+                                         )
+                                     }
+                                     "LIKED" -> SingleCardSongsContent(
+@@ -1774,7 +1776,8 @@ fun LibraryScreen(
+                                             isStreamingMode = isStreamingMode,
+                                             streamingDownloadedSongIds = streamingDownloadedSongIds,
+                                             streamingDownloadingSongIds = streamingDownloadingSongIds,
+-                                            onStreamingToggleDownload = onStreamingToggleDownload
++                                            onStreamingToggleDownload = onStreamingToggleDownload,
++                                            onStartRadio = onStartRadio
+                                         )
+                                     "PLAYLISTS" -> SingleCardPlaylistsContent(
+                                         playlists = playlists,
+@@ -1882,7 +1885,8 @@ fun LibraryScreen(
+                                         isStreamingMode = isStreamingMode,
+                                         streamingDownloadedSongIds = streamingDownloadedSongIds,
+                                         streamingDownloadingSongIds = streamingDownloadingSongIds,
+-                                        onStreamingToggleDownload = onStreamingToggleDownload
++                                        onStreamingToggleDownload = onStreamingToggleDownload,
++                                            onStartRadio = onStartRadio
+                                     )
+                                     "EXPLORER" -> SingleCardExplorerContent(
+                                         songs = songs,
+@@ -2326,7 +2330,8 @@ fun SingleCardSongsContent(
+     isStreamingMode: Boolean = false,
+     streamingDownloadedSongIds: Set<String> = emptySet(),
+     streamingDownloadingSongIds: Set<String> = emptySet(),
+-    onStreamingToggleDownload: ((Song) -> Unit)? = null
++    onStreamingToggleDownload: ((Song) -> Unit)? = null,
++    onStartRadio: ((Song) -> Unit)? = null
+ ) {
+     val context = LocalContext.current
+     val appSettings = remember { AppSettings.getInstance(context) }
+@@ -2630,6 +2635,7 @@ fun SingleCardSongsContent(
+             isDownloaded = isStreamingMode && streamingDownloadedSongIds.contains(targetSong.id),
+             isDownloading = isStreamingMode && streamingDownloadingSongIds.contains(targetSong.id),
+             onToggleDownload = if (isStreamingMode) ({ onStreamingToggleDownload?.invoke(targetSong) }) else null,
++            onStartRadio = if (isStreamingMode && onStartRadio != null) ({ onStartRadio(targetSong) }) else null,
+             isStreaming = isStreamingMode
+         )
+     }
+@@ -6685,7 +6691,8 @@ fun YearGroupedSongsContent(
+     isStreamingMode: Boolean = false,
+     streamingDownloadedSongIds: Set<String> = emptySet(),
+     streamingDownloadingSongIds: Set<String> = emptySet(),
+-    onStreamingToggleDownload: ((Song) -> Unit)? = null
++    onStreamingToggleDownload: ((Song) -> Unit)? = null,
++    onStartRadio: ((Song) -> Unit)? = null
+ ) {
+     val context = LocalContext.current
+     var songForOverflow by remember { mutableStateOf<Song?>(null) }
+@@ -6863,6 +6870,7 @@ fun YearGroupedSongsContent(
+             isDownloaded = isStreamingMode && streamingDownloadedSongIds.contains(targetSong.id),
+             isDownloading = isStreamingMode && streamingDownloadingSongIds.contains(targetSong.id),
+             onToggleDownload = if (isStreamingMode) ({ onStreamingToggleDownload?.invoke(targetSong) }) else null,
++            onStartRadio = if (isStreamingMode && onStartRadio != null) ({ onStartRadio(targetSong) }) else null,
+             isStreaming = isStreamingMode
+         )
+     }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/RadioQueue.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/RadioQueue.kt
+new file mode 100644
+index 00000000..ed1b210a
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/RadioQueue.kt
+@@ -0,0 +1,11 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++/** Fork: the queue of "Start radio from this song": the seed first, then songs like it, each song once. */
++object RadioQueue {
++    fun <T> build(seed: T, related: List<T>, idOf: (T) -> String, size: Int = 50): List<T> {
++        val seen = HashSet<String>().apply { add(idOf(seed)) }
++        return listOf(seed) + related.filter { seen.add(idOf(it)) }.take(size - 1)
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+index 36038f15..506af92c 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+@@ -1670,6 +1670,19 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+         }
+     }
+ 
++    /** Fork (Octo): "Start radio from this song": the song, then songs like it (Octo mixes owned and previewed ones). */
++    fun startRadio(songId: String) {
++        viewModelScope.launch {
++            val seed = knownSong(songId) ?: try { repository.getSongById(songId) as? StreamingSong } catch (e: Exception) { null }
++            val related = try { repository.getRelatedTracks(songId, 60) } catch (e: Exception) { emptyList() }
++            if (seed == null || related.isEmpty()) {
++                showToast("No radio for this song")
++                return@launch
++            }
++            playQueue(chromahub.rhythm.app.features.octo.RadioQueue.build(seed, related, { it.id }), 0)
++        }
++    }
++
+     private fun knownSong(songId: String): StreamingSong? =
+         _allSongs.value.firstOrNull { it.id == songId }
+             ?: _likedSongs.value.firstOrNull { it.id == songId }
+diff --git a/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt b/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
+index d5d39be7..6a5cccba 100644
+--- a/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
++++ b/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
+@@ -89,6 +89,7 @@ fun SongOverflowBottomSheet(
+     onEditSong: (() -> Unit)? = null,
+     onPlayNext: (() -> Unit)? = null,
+     onAddToQueue: (() -> Unit)? = null,
++    onStartRadio: (() -> Unit)? = null,
+     isFavorite: Boolean? = null,
+     onToggleFavorite: (() -> Unit)? = null,
+     onAddToPlaylist: (() -> Unit)? = null,
+@@ -155,7 +156,7 @@ fun SongOverflowBottomSheet(
+ 
+     val menuItems = remember(
+         song, isFavorite, isDownloaded, isDownloading,
+-        onPlayNext, onAddToQueue, onToggleFavorite, onAddToPlaylist,
++        onPlayNext, onAddToQueue, onStartRadio, onToggleFavorite, onAddToPlaylist,
+         onGoToAlbum, onGoToArtist, onShowSongInfo, onToggleDownload,
+         onRemoveFromPlaylist, onAddToBlacklist, onDeleteSong, finalOnShare
+     ) {
+@@ -180,6 +181,16 @@ fun SongOverflowBottomSheet(
+                     )
+                 )
+             }
++            onStartRadio?.let { action ->
++                add(
++                    SongOverflowItem(
++                        title = "Start radio",
++                        icon = MaterialSymbolIcon("radio"),
++                        iconColor = primaryIconColor,
++                        onClick = action
++                    )
++                )
++            }
+             onAddToPlaylist?.let { action ->
+                 add(
+                     SongOverflowItem(
+diff --git a/app/src/main/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuard.kt b/app/src/main/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuard.kt
+new file mode 100644
+index 00000000..4b1f7025
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuard.kt
+@@ -0,0 +1,65 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.util.coil
++
++import okhttp3.Interceptor
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import java.security.MessageDigest
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * Fork: when a cover cannot be made in time (Octo's cover aggregator, a slow Navidrome), the server answers 200 with
++ * its own placeholder picture (the "navidrome" disc). Coil cached that as the song's cover, so the real cover never
++ * came back until the cache was cleared. The guard learns what the server's placeholder looks like by asking for a
++ * cover that cannot exist, and turns any response with the same bytes into a 404: the app shows its own fallback,
++ * and nothing is cached for the next try.
++ */
++class CoverPlaceholderRegistry {
++    private val hashes = ConcurrentHashMap<String, String>()
++    private val none = "-"
++
++    /** [probe] fetches the server's picture for a cover that does not exist (null if it answered no picture); asked once per [host]. */
++    fun isPlaceholder(host: String, bytes: ByteArray, probe: () -> ByteArray?): Boolean {
++        val known = hashes.getOrPut(host) { probe()?.let(::sha256) ?: none }
++        return known != none && known == sha256(bytes)
++    }
++
++    private fun sha256(bytes: ByteArray) =
++        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
++}
++
++class CoverPlaceholderInterceptor : Interceptor {
++    private val registry = CoverPlaceholderRegistry()
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        if (!request.url.encodedPath.contains("getCoverArt") || request.url.queryParameter("id") == PROBE_ID) {
++            return chain.proceed(request)
++        }
++        val response = chain.proceed(request)
++        if (!response.isSuccessful) return response
++        val type = response.body.contentType()
++        val bytes = runCatching { response.body.bytes() }.getOrNull() ?: return response
++        val host = request.url.host + ":" + request.url.port
++        val placeholder = runCatching {
++            registry.isPlaceholder(host, bytes) {
++                val probeUrl = request.url.newBuilder().setQueryParameter("id", PROBE_ID).build()
++                chain.proceed(request.newBuilder().url(probeUrl).build()).use { r ->
++                    if (r.isSuccessful && r.body.contentType()?.type == "image") r.body.bytes() else null
++                }
++            }
++        }.getOrDefault(false)
++        return if (placeholder) {
++            response.newBuilder().code(404).message("Server placeholder cover")
++                .body("".toResponseBody("text/plain".toMediaType())).build()
++        } else {
++            response.newBuilder().body(bytes.toResponseBody(type)).build()
++        }
++    }
++
++    companion object {
++        const val PROBE_ID = "rhythm-no-such-cover"
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/RadioQueueTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/RadioQueueTest.kt
+new file mode 100644
+index 00000000..176ce439
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/RadioQueueTest.kt
+@@ -0,0 +1,23 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class RadioQueueTest {
++    @Test
++    fun theSeedComesFirstAndEachSongOnce() {
++        assertEquals(listOf("a", "b", "c"), RadioQueue.build("a", listOf("b", "a", "c", "b"), { it }))
++    }
++
++    @Test
++    fun theQueueIsCappedAtTheSize() {
++        assertEquals(listOf("a", "b", "c"), RadioQueue.build("a", listOf("b", "c", "d", "e"), { it }, size = 3))
++    }
++
++    @Test
++    fun aSeedWithNothingSimilarIsAQueueOfOne() {
++        assertEquals(listOf("a"), RadioQueue.build("a", emptyList(), { it }))
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuardTest.kt b/app/src/test/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuardTest.kt
+new file mode 100644
+index 00000000..6d41981f
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/util/coil/CoverPlaceholderGuardTest.kt
+@@ -0,0 +1,34 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.util.coil
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CoverPlaceholderGuardTest {
++    private val disc = byteArrayOf(1, 2, 3, 4)
++    private val real = byteArrayOf(9, 9, 9)
++
++    @Test
++    fun theServersPlaceholderIsRecognisedAndARealCoverIsNot() {
++        val registry = CoverPlaceholderRegistry()
++        assertTrue(registry.isPlaceholder("h:1", disc) { disc })
++        assertFalse(registry.isPlaceholder("h:1", real) { disc })
++    }
++
++    @Test
++    fun theProbeRunsOncePerServer() {
++        val registry = CoverPlaceholderRegistry()
++        var probes = 0
++        repeat(3) { registry.isPlaceholder("h:1", real) { probes++; disc } }
++        assertEquals(1, probes)
++    }
++
++    @Test
++    fun aServerThatAnswersNoPictureForTheProbeNeverMatches() {
++        val registry = CoverPlaceholderRegistry()
++        assertFalse(registry.isPlaceholder("h:2", disc) { null })
++    }
++}
+-- 
+2.56.0
+

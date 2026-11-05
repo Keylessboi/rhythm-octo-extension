@@ -1,0 +1,96 @@
+From 5521a2d9df9aa64dd7a2b8456b49add886c1217f Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 06:39:28 -0500
+Subject: [PATCH 10/12] fix(octo): recognise Octo 2026.10 radios by their
+ generated cover ids
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../rhythm/app/features/octo/OctoStations.kt         |  2 +-
+ .../streaming/data/provider/SubsonicApiClient.kt     | 12 ++++++++++--
+ .../rhythm/app/features/octo/OctoStationsTest.kt     |  4 ++--
+ .../data/provider/SubsonicOctoRadioPlaylistTest.kt   |  9 +++++++++
+ 4 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+index 89c6d65a..bb9a7c64 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+@@ -27,7 +27,7 @@ import chromahub.rhythm.app.features.streaming.presentation.viewmodel.StreamingM
+ 
+ /** Fork (Octo): which playlists are Octo's stations, and in what order they are offered. */
+ object OctoStations {
+-    private val first = listOf("Starter Radio", "Your Mix", "Discovery Mix")
++    private val first = listOf("Starter Radio", "Your Radio", "Your Mix", "Discovery Radio", "Discovery Mix")
+ 
+     fun of(playlists: List<StreamingPlaylist>): List<StreamingPlaylist> =
+         playlists.filter { it.isOctoRadio && it.songCount > 0 }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index b677af3d..3dfb01c2 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -1330,7 +1330,7 @@ class SubsonicApiClient internal constructor(
+                         songCount = playlist.optInt("songCount", 0),
+                         owner = playlist.optString("owner").takeIf { it.isNotBlank() },
+                         isPublic = playlist.optBoolean("public", true),
+-                        isOctoRadio = coverArtId == OCTO_RADIO_COVER_ID
++                        isOctoRadio = OctoRadioCover.matches(coverArtId)
+                     )
+                 )
+             }
+@@ -1433,7 +1433,6 @@ class SubsonicApiClient internal constructor(
+     private companion object {
+         private const val TAG = "SubsonicApiClient"
+         /** Octo marks its generated radio playlists with this `coverArt` id (SubsonicResponseBuilder.RadioPlaylistFields). */
+-        private const val OCTO_RADIO_COVER_ID = "octo-radio"
+         private const val PREFS_NAME = "streaming_subsonic_credentials"
+         private const val KEY_SERVER_URL = "server_url"
+         private const val KEY_USERNAME = "username"
+@@ -1494,3 +1493,12 @@ internal fun parseSubsonicTimestamp(value: String?): Long? {
+         }
+     }
+ }
++
++/** Fork (Octo): which playlist covers mark one of Octo's generated radios. */
++internal object OctoRadioCover {
++    private const val LEGACY_ID = "octo-radio"
++    // Octo 2026.10 hands its radios a generated cover id: "or" plus 22 base62 characters.
++    private val generated = Regex("^or[A-Za-z0-9]{20,22}$")
++
++    fun matches(coverArtId: String?): Boolean = coverArtId != null && (coverArtId == LEGACY_ID || generated.matches(coverArtId))
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
+index 1d163045..6c510d50 100644
+--- a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoStationsTest.kt
+@@ -21,7 +21,7 @@ class OctoStationsTest {
+ 
+     @Test
+     fun yourMixAndDiscoveryComeBeforeTheArtistRadios() {
+-        val r = OctoStations.of(listOf(p("OutKast Radio"), p("Discovery Mix"), p("Your Mix"), p("Trap Radio")))
+-        assertEquals(listOf("Your Mix", "Discovery Mix", "OutKast Radio", "Trap Radio"), r.map { it.name })
++        val r = OctoStations.of(listOf(p("OutKast Radio"), p("Discovery Radio"), p("Your Radio"), p("Trap Radio")))
++        assertEquals(listOf("Your Radio", "Discovery Radio", "OutKast Radio", "Trap Radio"), r.map { it.name })
+     }
+ }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+index c6b560e1..20c4dfd9 100644
+--- a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+@@ -115,4 +115,13 @@ class SubsonicOctoRadioPlaylistTest {
+             }
+         }
+     }
++
++    @Test
++    fun currentOctoRadiosAreRecognisedByTheirGeneratedCoverIds() {
++        assertTrue(OctoRadioCover.matches("or1Piz0R6pJ4GYQyEul8XT"))
++        assertTrue(OctoRadioCover.matches("octo-radio"))
++        assertFalse(OctoRadioCover.matches("pl-4AoYlyR0y10cKBMvbheChj_fc5b5d40650d0150"))
++        assertFalse(OctoRadioCover.matches("ogXY8Zlh9lMAuQRFyQGhcq_2c99"))
++        assertFalse(OctoRadioCover.matches(null))
++    }
+ }
+-- 
+2.56.0
+
