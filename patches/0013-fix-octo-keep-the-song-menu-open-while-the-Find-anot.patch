@@ -1,0 +1,52 @@
+From 73df17044ebe1b6294951a94b7f63abf9956d005 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 06:59:20 -0500
+Subject: [PATCH] fix(octo): keep the song menu open while the Find another
+ copy sheet is showing
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../components/bottomsheets/SongOverflowBottomSheet.kt      | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt b/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
+index 490bc946..f0d86749 100644
+--- a/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
++++ b/app/src/main/java/chromahub/rhythm/app/shared/presentation/components/bottomsheets/SongOverflowBottomSheet.kt
+@@ -80,6 +80,7 @@ private data class SongOverflowItem(
+     val title: String,
+     val icon: MaterialSymbolIcon,
+     val iconColor: Color = Color.Unspecified,
++    val keepOpen: Boolean = false,
+     val onClick: () -> Unit
+ )
+ 
+@@ -137,7 +138,7 @@ fun SongOverflowBottomSheet(
+             .supports(chromahub.rhythm.app.features.octo.OCTO_ACQUISITIONS)
+     }
+     if (showFindCopy) {
+-        chromahub.rhythm.app.features.octo.FindCopySheet(song.id, song.title) { showFindCopy = false }
++        chromahub.rhythm.app.features.octo.FindCopySheet(song.id, song.title) { showFindCopy = false; onDismiss() }
+     }
+ 
+     val artworkShape = rememberExpressiveShapeFor(
+@@ -210,6 +211,7 @@ fun SongOverflowBottomSheet(
+                         title = "Find another copy",
+                         icon = MaterialSymbolIcon("search"),
+                         iconColor = primaryIconColor,
++                        keepOpen = true,
+                         onClick = { showFindCopy = true }
+                     )
+                 )
+@@ -525,7 +527,7 @@ fun SongOverflowBottomSheet(
+                             onClick = {
+                                 HapticUtils.performHapticFeedback(context, haptic, HapticType.HEAVY)
+                                 item.onClick()
+-                                onDismiss()
++                                if (!item.keepOpen) onDismiss()
+                             },
+                             modifier = Modifier
+                                 .fillMaxWidth()
+-- 
+2.56.0
+
