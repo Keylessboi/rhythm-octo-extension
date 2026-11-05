@@ -1,0 +1,320 @@
+From c6f3635d72ab7d8d3d1b3dc02cec328f85288b32 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Wed, 4 Nov 2026 20:30:01 -0500
+Subject: [PATCH] feat(octo): keep Octo's radio playlists downloaded as a
+ rotating temporary cache
+
+Octo's generated radio playlists (coverArt octo-radio) are kept next to the playlists the user chose,
+previews included; what rotates out of them is released by the existing pin reconciler.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../data/provider/StreamingProviderModels.kt  |   4 +-
+ .../data/provider/SubsonicApiClient.kt        |   5 +-
+ .../StreamingMusicRepositoryImpl.kt           |   1 +
+ .../rhythm/app/offline/PinSettings.kt         |  11 ++
+ .../chromahub/rhythm/app/offline/PinSync.kt   |  12 +-
+ .../provider/SubsonicOctoRadioPlaylistTest.kt | 118 ++++++++++++++++++
+ .../app/offline/PinSyncOctoRadioTest.kt       |  30 +++++
+ .../spatial/media3/offline/PinReconciler.kt   |   2 +-
+ 8 files changed, 178 insertions(+), 5 deletions(-)
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
+index d2a9d4e3..491363ec 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
+@@ -69,7 +69,9 @@ data class ProviderPlaylist(
+     val artworkUrl: String? = null,
+     val songCount: Int = 0,
+     val owner: String? = null,
+-    val isPublic: Boolean = true
++    val isPublic: Boolean = true,
++    /** Fork (Octo): one of Octo's generated Last.fm radio playlists (read-only, rotating, previews included). */
++    val isOctoRadio: Boolean = false
+ )
+ 
+ /**
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 4a44597c..6658f1e7 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -1322,7 +1322,8 @@ class SubsonicApiClient internal constructor(
+                         artworkUrl = coverArtId?.let { buildCoverArtUrl(it, 500) },
+                         songCount = playlist.optInt("songCount", 0),
+                         owner = playlist.optString("owner").takeIf { it.isNotBlank() },
+-                        isPublic = playlist.optBoolean("public", true)
++                        isPublic = playlist.optBoolean("public", true),
++                        isOctoRadio = coverArtId == OCTO_RADIO_COVER_ID
+                     )
+                 )
+             }
+@@ -1424,6 +1425,8 @@ class SubsonicApiClient internal constructor(
+ 
+     private companion object {
+         private const val TAG = "SubsonicApiClient"
++        /** Octo marks its generated radio playlists with this `coverArt` id (SubsonicResponseBuilder.RadioPlaylistFields). */
++        private const val OCTO_RADIO_COVER_ID = "octo-radio"
+         private const val PREFS_NAME = "streaming_subsonic_credentials"
+         private const val KEY_SERVER_URL = "server_url"
+         private const val KEY_USERNAME = "username"
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+index 04dbc73c..d3e12bdb 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+@@ -1384,6 +1384,7 @@ class StreamingMusicRepositoryImpl(
+                     id = encodePlaylistId(StreamingServiceId.SUBSONIC, it.providerId),
+                     name = it.name,
+                     songCount = it.songCount,
++                    octoRadio = it.isOctoRadio,
+                 )
+             }
+         }
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
+index 493dc3ac..6611af46 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
+@@ -24,6 +24,16 @@ class PinSettings private constructor(private val prefs: SharedPreferences) {
+     /** The names of the playlists the user switched on. */
+     val keptPlaylists: StateFlow<Set<String>> = _keptPlaylists.asStateFlow()
+ 
++    private val _keepOctoRadio = MutableStateFlow(prefs.getBoolean(KEY_OCTO_RADIO, true))
++    /** Keep Octo's generated radio playlists (recommendations) downloaded; they rotate, and what leaves them is released. */
++    val keepOctoRadio: StateFlow<Boolean> = _keepOctoRadio.asStateFlow()
++
++    @Synchronized
++    fun setKeepOctoRadio(on: Boolean) {
++        prefs.edit().putBoolean(KEY_OCTO_RADIO, on).apply()
++        _keepOctoRadio.value = on
++    }
++
+     @Synchronized
+     fun setKeepFavorites(on: Boolean) {
+         prefs.edit().putBoolean(KEY_FAVORITES, on).apply()
+@@ -80,6 +90,7 @@ class PinSettings private constructor(private val prefs: SharedPreferences) {
+         private const val PREFS = "offline_cache"
+         private const val KEY_FAVORITES = "pin_favorites"
+         private const val KEY_PLAYLISTS_KEPT = "pin_playlists_kept_names"
++        private const val KEY_OCTO_RADIO = "pin_octo_radio"
+         private const val KEY_LEGACY_ON = "pin_playlists_on"
+         private const val KEY_LEGACY_OFF = "pin_playlists_off"
+         private const val KEY_LAST_SYNC = "pin_last_sync_ms"
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+index 21f2bc27..5f88b94a 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+@@ -16,6 +16,7 @@ import chromahub.rhythm.spatial.media3.offline.DownloadStateStore
+ import chromahub.rhythm.spatial.media3.offline.DownloadPriority
+ import chromahub.rhythm.spatial.media3.offline.OfflineState
+ import chromahub.rhythm.spatial.media3.offline.PinApply
++import chromahub.rhythm.spatial.media3.offline.PinPlaylist
+ import chromahub.rhythm.spatial.media3.offline.PinReconciler
+ import chromahub.rhythm.spatial.media3.offline.PinRunInterval
+ import chromahub.rhythm.spatial.media3.offline.PinSource
+@@ -89,6 +90,10 @@ object PinSync {
+     fun fromSources(sources: Map<String, SourceState>, songs: Map<String, StreamingSong> = emptyMap()) =
+         Observed(sources, songs, frozen = emptySet(), absent = emptySet(), listingRead = true)
+ 
++    /** The playlist names a sync keeps: the user's choices, plus Octo's radio playlists while [keepOctoRadio] is on. */
++    fun keptNames(chosen: Set<String>, listing: List<PinPlaylist>?, keepOctoRadio: Boolean): Set<String> =
++        if (!keepOctoRadio || listing == null) chosen else chosen + listing.filter { it.octoRadio }.map { it.name }
++
+     /** What [derive] worked out: the plan (also the [PinRunInterval.Run] it is judged by) and the ledger's entries for it. */
+     data class Derived(
+         /** The plan and what the ledger needs for it (the [PinRunInterval.Run] tells a real change from a no-op). */
+@@ -120,13 +125,16 @@ object PinSync {
+         val listing = repo.fetchPlaylistsForPins()
+         // A phone that ran the build that kept playlists by id: those switches become names (needs a good listing).
+         listing.getOrNull()?.takeIf { it.isNotEmpty() }?.let { list -> settings.migrateLegacyIds(list.associate { it.id to it.name }) }
+-        val selection = PlaylistSelector.select(listing, settings.keptPlaylists.value, heldPlaylists)
++        val wanted = keptNames(settings.keptPlaylists.value, listing.getOrNull(), settings.keepOctoRadio.value)
++        val selection = PlaylistSelector.select(listing, wanted, heldPlaylists)
+         // Frozen (listing not believed) and absent (deleted on the server): their pins stay exactly as they are.
+         (selection.frozen + selection.absent).forEach { sources[it] = SourceState.Unavailable }
+         for ((name, playlists) in selection.fetch) {
+             // Playlists that share a name are one source: the union of their songs.
+             val parts = playlists.map { playlist ->
+-                val fetched = repo.fetchPlaylistSongsForPins(playlist.id).map { DownloadEligibility.downloadable(it) }
++                // Octo's radio playlists are the recommendations the user wants for offline: their previews are kept too,
++                // and leave with the playlist's rotation (a temporary cache). Everywhere else a preview is never kept.
++                val fetched = repo.fetchPlaylistSongsForPins(playlist.id).map { if (playlist.octoRadio) it else DownloadEligibility.downloadable(it) }
+                 fetched.getOrNull()?.forEach { songs[it.id] = it }
+                 SourceState.of(fetched.map { list -> list.map { it.id } }, playlist.songCount)
+             }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+new file mode 100644
+index 00000000..c6b560e1
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+@@ -0,0 +1,118 @@
++/*
++ * SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++package chromahub.rhythm.app.features.streaming.data.provider
++
++import android.content.Context
++import android.content.ContextWrapper
++import android.content.SharedPreferences
++import kotlinx.coroutines.runBlocking
++import mockwebserver3.Dispatcher
++import mockwebserver3.MockResponse
++import mockwebserver3.MockWebServer
++import mockwebserver3.RecordedRequest
++import okhttp3.OkHttpClient
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.TimeUnit
++
++/** Octo marks its generated radio playlists with coverArt "octo-radio"; the app must tell them from ordinary playlists. */
++class SubsonicOctoRadioPlaylistTest {
++
++    private lateinit var server: MockWebServer
++
++    @Before
++    fun setUp() {
++        server = MockWebServer()
++        server.dispatcher = object : Dispatcher() {
++            override fun dispatch(request: RecordedRequest): MockResponse {
++                return when (request.url.encodedPath) {
++                    "/rest/getPlaylists.view" -> ok(",\"playlists\":{\"playlist\":[{\"id\":\"r1\",\"name\":\"Your Mix\",\"coverArt\":\"octo-radio\",\"readonly\":true,\"songCount\":3},{\"id\":\"p1\",\"name\":\"Gym\",\"coverArt\":\"pl-p1\",\"songCount\":5}]}")
++                    else -> ok()
++                }
++            }
++        }
++        server.start()
++    }
++
++    @After
++    fun tearDown() {
++        server.close()
++    }
++
++    private fun ok(fields: String = "") = MockResponse.Builder()
++        .body("""{"subsonic-response":{"status":"ok","version":"1.16.1"$fields}}""")
++        .build()
++
++    private fun client(): SubsonicApiClient {
++        val client = SubsonicApiClient(
++            FakeContext(),
++            OkHttpClient.Builder().readTimeout(2, TimeUnit.SECONDS).build(),
++            libraryFetchRetryDelayMs = 10
++        )
++        val login = runBlocking { client.login(server.url("/").toString(), "user", "secret", saveCredentials = false) }
++        assertTrue("login failed: ${login.exceptionOrNull()}", login.isSuccess)
++        return client
++    }
++
++    private fun playlists() = runBlocking { client().getPlaylists() }.getOrThrow().associateBy { it.providerId }
++
++    @Test
++    fun anOctoRadioPlaylistIsRecognised() {
++        assertTrue(playlists().getValue("r1").isOctoRadio)
++    }
++
++    @Test
++    fun anOrdinaryPlaylistIsNot() {
++        assertFalse(playlists().getValue("p1").isOctoRadio)
++    }
++
++    private class FakeContext : ContextWrapper(null) {
++        private val prefs = FakeSharedPreferences()
++        override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences = prefs
++    }
++
++    private class FakeSharedPreferences : SharedPreferences {
++        private val values = ConcurrentHashMap<String, Any>()
++
++        override fun getAll(): Map<String, *> = values
++        override fun getString(key: String, defValue: String?) = values[key] as? String ?: defValue
++        override fun getStringSet(key: String, defValues: Set<String>?) =
++            @Suppress("UNCHECKED_CAST") (values[key] as? Set<String> ?: defValues)
++        override fun getInt(key: String, defValue: Int) = values[key] as? Int ?: defValue
++        override fun getLong(key: String, defValue: Long) = values[key] as? Long ?: defValue
++        override fun getFloat(key: String, defValue: Float) = values[key] as? Float ?: defValue
++        override fun getBoolean(key: String, defValue: Boolean) = values[key] as? Boolean ?: defValue
++        override fun contains(key: String) = values.containsKey(key)
++        override fun registerOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
++        override fun unregisterOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
++
++        override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
++            private val pending = HashMap<String, Any?>()
++            private var clear = false
++            override fun putString(key: String, value: String?) = apply { pending[key] = value }
++            override fun putStringSet(key: String, values: Set<String>?) = apply { pending[key] = values }
++            override fun putInt(key: String, value: Int) = apply { pending[key] = value }
++            override fun putLong(key: String, value: Long) = apply { pending[key] = value }
++            override fun putFloat(key: String, value: Float) = apply { pending[key] = value }
++            override fun putBoolean(key: String, value: Boolean) = apply { pending[key] = value }
++            override fun remove(key: String) = apply { pending[key] = null }
++            override fun clear() = apply { clear = true }
++            override fun commit(): Boolean {
++                apply()
++                return true
++            }
++            override fun apply() {
++                if (clear) values.clear()
++                pending.forEach { (key, value) -> if (value == null) values.remove(key) else values[key] = value }
++            }
++        }
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt b/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
+new file mode 100644
+index 00000000..abdee106
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.offline
++
++import chromahub.rhythm.spatial.media3.offline.PinPlaylist
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class PinSyncOctoRadioTest {
++    private val listing = listOf(
++        PinPlaylist("a", "Your Mix", 20, octoRadio = true),
++        PinPlaylist("b", "Gym", 5),
++        PinPlaylist("c", "Starter Radio", 20, octoRadio = true),
++    )
++
++    @Test
++    fun octoRadioPlaylistsAreKeptWithTheUsersChoices() {
++        assertEquals(setOf("Gym", "Your Mix", "Starter Radio"), PinSync.keptNames(setOf("Gym"), listing, true))
++    }
++
++    @Test
++    fun withTheSwitchOffOnlyTheUsersChoicesAreKept() {
++        assertEquals(setOf("Gym"), PinSync.keptNames(setOf("Gym"), listing, false))
++    }
++
++    @Test
++    fun anUnreadListingKeepsTheChoicesAsTheyWere() {
++        assertEquals(setOf("Gym"), PinSync.keptNames(setOf("Gym"), null, true))
++    }
++}
+diff --git a/spatial-media3/src/main/java/chromahub/rhythm/spatial/media3/offline/PinReconciler.kt b/spatial-media3/src/main/java/chromahub/rhythm/spatial/media3/offline/PinReconciler.kt
+index 5e63375c..bc2f4c39 100644
+--- a/spatial-media3/src/main/java/chromahub/rhythm/spatial/media3/offline/PinReconciler.kt
++++ b/spatial-media3/src/main/java/chromahub/rhythm/spatial/media3/offline/PinReconciler.kt
+@@ -149,7 +149,7 @@ object PinReconciler {
+ }
+ 
+ /** A playlist as the server lists it. [id] is the app's playlist id (used to read its songs); the pin reason carries the [name]. */
+-data class PinPlaylist(val id: String, val name: String, val songCount: Int)
++data class PinPlaylist(val id: String, val name: String, val songCount: Int, val octoRadio: Boolean = false)
+ 
+ /**
+  * What a sync reads, by playlist name.
+-- 
+2.56.0
+

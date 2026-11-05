@@ -1,0 +1,363 @@
+From 1652f6e68daf3a8e56d48f60454134f5d479667c Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Tue, 3 Nov 2026 19:55:47 -0500
+Subject: [PATCH] feat(octo): say why a preview song is not downloaded
+
+---
+ .../viewmodel/StreamingMusicViewModel.kt      |   6 +
+ ...asc-room-type-classification-2026-09-28.md |  90 +++++++
+ .../research/blind-rt60-room-id-2026-09-28.md | 228 ++++++++++++++++++
+ 3 files changed, 324 insertions(+)
+ create mode 100644 docs/research/asc-room-type-classification-2026-09-28.md
+ create mode 100644 docs/research/blind-rt60-room-id-2026-09-28.md
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+index 6fd65abc..aab8c23e 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+@@ -1728,6 +1728,12 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+         }
+         // Off the main thread: a playlist is thousands of songs to serialize and write to the ledger.
+         viewModelScope.launch(Dispatchers.IO) {
++            // Fork (Octo): a preview is a stream, not the song; say so instead of queueing nothing in silence.
++            val previews = songs.count { !chromahub.rhythm.app.offline.DownloadEligibility.isDownloadable(it) }
++            if (previews > 0 && previews == songs.size) {
++                showToast("Preview songs can't be downloaded. Heart it so Octo adds it to your library.")
++                return@launch
++            }
+             val downloadedIds = _downloadedSongs.value.mapTo(HashSet()) { it.id }
+             // Fork: offline cache - a song already kept for another reason (favorites, a playlist) now also has the user's own.
+             chromahub.rhythm.app.offline.OfflineWiring.pinManually(songs.map { it.id }.filter { it in downloadedIds })
+diff --git a/docs/research/asc-room-type-classification-2026-09-28.md b/docs/research/asc-room-type-classification-2026-09-28.md
+new file mode 100644
+index 00000000..7644750d
+--- /dev/null
++++ b/docs/research/asc-room-type-classification-2026-09-28.md
+@@ -0,0 +1,90 @@
++# Acoustic scene / room-type classification from ambient audio
++Research note, 2026-09-28. Scope: the classification half only — given ambient sound (no emitted probe, ever), which environment is this? Hardware assumed: Pixel 9 Pro XL + Pixel Buds Pro 2 (LE Audio, mono 48 kHz, bud DSP in the path) and the phone's own 2-mic UNPROCESSED array.
++All DCASE numbers below were pulled from the official results tables on dcase.community (evaluation-dataset accuracy unless stated).
++
++## TL;DR
++- Compute is not the problem. DCASE's low-complexity limit is 128 kB of parameters and 30 MMACs per 1-s inference, and models inside it exist. At a 0.1–1 Hz decision cadence that is ~30 MFLOP/s — negligible next to the rendering load already measured in this project.
++- The sensor is the problem. The bud chain (NS/AGC/AEC) is optimised to remove the stationary noise and flatten the level, which are two of the main room cues. The phone's UNPROCESSED array is the only genuinely pre-DSP sensor and the only one with low frequencies and two channels.
++- Reverb buys you indoor/outdoor and a rough size prior, not room identity. Blind T60/DRR estimation from ambient noise is a solved-ish problem only with 4+ s of decaying signal, and RT60 ranges of bedroom/living room/classroom/carriage overlap heavily.
++- Realistic ceiling for the 5-class task with 5–10 s windows and in-domain training: ~75–88%, with bedroom↔living room the hard pair; outdoor and train carriage are easy. Silently, the honest answer is "unknown".
++
++## 1. Published benchmark numbers
++| Benchmark | Classes / clips | Baseline | Best | Notes |
++|---|---|---|---|---|
++| DCASE 2016 Task 1 (TUT ASC 2016) | 15 classes incl. home, office, classroom, library; 30-s | 77.2% (dev 72.5%) | 89.7% (CP-JKU, binaural+MFCC+spectrogram fusion) | closest published analogue of "room type" |
++| DCASE 2017 Task 1 (TUT 2017) | 15 classes; 10-s | 65.7% (CI 63.4–68.0) | 80.4% (Han/COCAI) | clip length alone costs ~9 points vs 2016 |
++| DCASE 2020 Task 1A (TAU Urban 2020 Mobile) | 10 classes, 1-s, 11 devices (5 unseen) | 51.4% | 76.5% (ETRI); several 75–76% | device+city shift is the killer |
++| DCASE 2020 Task 1B | 3 coarse classes (indoor/outdoor/transport), 1 device, ≤500 kB | 89.5% | 96.5% (CP-JKU) | the coarse split you actually need is easy |
++| DCASE 2021 Task 1A | 10 classes, 1-s | 45.6% | 76.1% (QTI ResNorm / BC-ResNet-Mod) | |
++| DCASE 2021 Task 1B | single-device low-complexity | 77.1% | 88.4% (AIT) | |
++| DCASE 2022 Task 1 | 10 classes, ≤128 kB int8, ≤30 MMAC/inference | 44.2% | 59.6% (CP-JKU) | same budget you'd use on a phone |
++| DCASE 2023 Task 1 | same limits | 44.8% | 62.7% (CP-JKU) | |
++| RevRIR 2024 (arXiv 2406.03120) | identify 1 of 110 rooms from reverberant speech | — | 40% | shows room-identity-from-reverb is hard |
++
++Read: coarse indoor/outdoor/transport is 89–96%; ten urban scenes at 1 s is 60–76%; 15 room-ish classes with 30-s clips is 77–90%. Longer windows and coarser classes both help more than architecture.
++
++## 2. Which features matter
++- **Log-mel** (e.g. 64 mels, 25 ms/10 ms) is what every competitive DCASE system uses; it is the default and there is no evidence favouring a replacement at the top. Cost is ~1.6 M multiply-adds per second of audio.
++- **MFCC + deltas** was the DCASE 2016/2017 baseline and sits ~12–15 points behind the winning CNNs. Still perfectly usable for a sub-200 kB model; deltas/context are cheap (+1–3 points typical).
++- **GTCC / gammatone cepstra** buy better low-frequency resolution and are the front end of the standard blind-T60 CNN (Gamper & Tashev, IWAENC 2018, ERB filterbank). Useful if you care mainly about the decay structure.
++- **Modulation spectrum (2–20 Hz envelope)** is the most reverb-specific cheap feature: a room acts as a low-pass on the temporal envelope, so the 2–20 Hz modulation energy drops with reverberation (Gergen & Martin, Interspeech 2015). This is the single most defensible hand-crafted feature for your task.
++- **Hand-crafted vs CNN**: hand-crafted is not competitive at the top of any DCASE edition (~10–15 points behind), but the 2016 winner was itself a fusion of MFCC + spectrogram + binaural features, and the 2021–2023 low-complexity winners are small log-mel CNNs. For a <200 kB model, log-mel + a small CNN is still the right choice.
++
++## 3. Models small enough for the phone
++- **YAMNet**: MobileNetV1 depthwise; 3.73 M parameters, 14.2 MB float; 0.15–0.32 ms per inference on Snapdragon 8 Gen 1/3 NPUs (Qualcomm AI Hub model card). Outputs 521 AudioSet event classes, i.e. events not room types, and it is 16 kHz mono so it discards everything above 8 kHz. Good prototyping shortcut, poor fit for a reverb cue and for the bud's ~10–13 kHz band.
++- **BC-ResNet / BC-ResNet-Mod** (Kim et al., Interspeech 2021; QTI DCASE 2021 Task 1A submission): broadcasted residual 1D+2D convolutions, designed for tiny budgets; the DCASE 2021 Task 1A winner ran at 76.1% with residual normalisation.
++- **The DCASE low-complexity envelope** is the honest on-device budget: ≤128 kB parameters, ≤30 MMACs per 1-s inference, and that bought 59.6% (2022) / 62.7% (2023) on 10-class 1-s. A 5-class task with 5–10 s aggregation sits well inside this.
++- **Blind-T60 CNN** (Adobe, arXiv 1909.03642): 8,737 trainable parameters, real-time factor 0.0088 (~110× real-time, CPU-only, 2018 MacBook Pro). A CRNN joint estimator (WASPAA 2021, arXiv 2010.11167) used 369 k params.
++- **Spatial features are cheap and pay off**: with 2 channels, inter-channel coherence / spectro-spatial covariance features halved T60/DRR/C50 estimation error versus single-channel spectral features (arXiv 2411.03172, 2024). This is an argument for the phone array rather than the mono bud stream.
++- **Budget summary**: log-mel front end ≈ 1.6 M mult/s; 100–200 k-param int8 CNN ≈ 100–200 kB and ≤30 MMACs per decision; a 20–30-dim reverb block ≈ 10^5 ops/s. Entirely inside a few tenths of a percent of one phone core. The measured reference in this repo is that the 7.1 binaural bed costs ~1032 µs per 10 ms block on an A55 — the classifier is two-to-three orders smaller than that.
++
++## 4. Does reverb actually distinguish room TYPE?
++Partly, and less than the goal statement hopes.
++- **Outdoor vs indoor is the strong reverb split**: outdoors there is essentially no late tail (DRR ≈ 0 dB), indoors it is −5 to −15 dB. This one is reliable and worth building on.
++- **RT60 separates room types weakly**: bedroom ~0.3–0.5 s, living room ~0.4–0.6 s, classroom ~0.5–0.9 s, train carriage ~0.3–0.8 s (carriage is small but highly reflective, then partly damped by seating). Absorption dominates over volume, so RT60 alone will not tell bedroom from living room.
++- **Blind T60/DRR from ambient sound without any excitation is exactly the ACE Challenge task** (Eaton et al., IEEE/ACM TASLP 2016; ACE results report arXiv 1606.03365). The report's own error breakdowns show accuracy depends on SNR (18 / 12 / −1 dB), on noise type (ambient, babble, fan) and on utterance length (<5 s, <15 s, ≥15 s). Practical rule from the Adobe work: discard/repeat anything under ~4 s, estimate every 0.5 s and take the median over stationary audio.
++- **What scene CNNs actually key on is the noise/event bed, not the impulse response.** The evidence is the benchmark structure: the same acoustic material is 89–96% when the decision is indoor/outdoor/transport and 60–76% when it is ten specific scenes, and performance drops ~10–15 points on unseen devices/cities. The discriminative signal is the background texture (train rumble, chatter, traffic, keyboard), with reverb as a helpful but secondary channel.
++
++## 5. Realistic ceiling and audio per decision
++- Standard ASC uses 1-s segments with 50% overlap and aggregates over ~10 s. At 1 s the DCASE 10-class multi-device systems are 60–76%; with a 5–10 s window and a 5-class, easier label set you should expect higher.
++- Working estimate for {bedroom, living room, classroom, train carriage, outside} with in-domain training and 5–10 s windows: **75–88% overall**, with outside and train carriage >90%, and bedroom vs living room ~60–70% pairwise. That is an extrapolation from the 2020 Task 1B (3-class, 89–96%) and TUT 2016 (15-class 30-s, 77–90%) numbers, not a measured result for this exact label set.
++- A 1-s decision is too noisy for preset switching; use 1 Hz posteriors over a 5–10 s rolling window, and require two consecutive windows to agree before changing preset.
++
++## 6. When it is quiet or silent
++- **Genuinely silent**: MEMS mic self-noise (~30 dB SPL-A equivalent) is uncorrelated, so a blind decay estimator sees a *dry* signal and will report something like "outdoors". Never update on that. Gate on input level and on non-stationarity (envelope kurtosis / spectral flux), freeze the posterior, decay confidence, and expose an explicit `unknown`. A 2.5–5 s minimum before the first decision is realistic.
++- **Quiet but not silent** (talking, TV, keyboard, footsteps): this is the regime the ACE estimators are designed for, and it works — non-stationary events give you decay slopes and modulation-spectrum cues. Purely stationary HVAC/fan noise is the bad case (ACE shows error growth toward −1 dB SNR).
++- Android caveat already established in this repo: silenced capture (or bud-DSP gating) must be treated as "no data", not as "quiet room".
++
++## 7. Earbud DSP vs phone array
++- The buds' own NS/AGC/AEC runs before LC3 and cannot be bypassed. NS attenuates stationary noise (train rumble, HVAC, fan — the carriage and classroom cues), AGC compresses level dynamics, AEC removes the user's own voice tail — all three are room cues. This repo's own recon recorded a loud continuous sweep arriving as near-digital-silence over HFP: the bud DSP will gate steady-state input.
++- If the usable bud band really is only ~10–13 kHz, the low-frequency rumble that separates a carriage from a classroom is gone as well.
++- Verdict: **the bud stream can support an event/activity detector ("someone is talking", "music is playing"), not a reliable reverb estimator.** The phone's UNPROCESSED 2-channel array at 48 kHz is the sensor for the reverb leg, and its inter-channel coherence is a genuinely useful extra feature.
++
++## 8. What I would build first, and why
++1. **Phone-array UNPROCESSED → 16 kHz, 64-mel log-mel + deltas, 100–200 k-param int8 DS-CNN/BC-ResNet-Mod**, trained for 5 classes with device/city augmentation. TFLite + NNAPI, 1 Hz inference, 5–10 s aggregation, hysteresis, level gate, `unknown` state.
++2. **Add a 20–30-dim hand-crafted reverb block** and late-fuse it: per-band envelope decay slopes (RT60 proxy) on detected decays, inter-channel coherence, 2–20 Hz modulation-spectrum energy, spectral kurtosis/flatness, level dynamics. This is what makes "outdoors", "carriage" and "classroom" separable when the event bed is ambiguous, and it costs nothing.
++3. **Train on TUT ASC 2016** (home/office/classroom/library) + **TAU Urban Acoustic Scenes 2020 Mobile** (train/tram/street/park) + your own labelled recordings, with the same device-simulation chain used at inference.
++4. **Earbuds only as a secondary/fallback event detector**, never as the reverb sensor.
++
++Why this order: the phone array is the only pre-DSP sensor, it has the low band and two channels, and the total classifier cost (<0.5 MB, a few MMACs/s) is dwarfed by the existing rendering budget. The bottleneck is labelled in-domain data, not compute.
++
++## Sources
++- DCASE challenge results pages: 2016, 2017, 2020 (Task 1A/1B), 2021 (Task 1A/1B), 2022, 2023 — dcase.community.
++- Heittola, Mesaros, Virtanen, "Acoustic scene classification in DCASE 2020 Challenge: generalization across devices and low complexity solutions", DCASE 2020 workshop (arXiv:2005.14623).
++- Mesaros, Heittola, Virtanen, "TUT database for acoustic scene classification and sound event detection", EUSIPCO 2016.
++- Mesaros et al., "A multi-device dataset for urban acoustic scene classification", DCASE 2018.
++- Eghbal-Zadeh et al. (CP-JKU), DCASE 2016 Task 1 winner; Han et al. (COCAI), DCASE 2017.
++- Kim et al., "Broadcasted Residual Learning for Efficient Keyword Spotting", Interspeech 2021; QTI DCASE 2021 submission (arXiv:2206.13909).
++- Schmid et al. (CP-JKU), DCASE 2022/2023 low-complexity ASC submissions.
++- Howard et al., MobileNets (2017); YAMNet — Qualcomm AI Hub model card (3.73 M params, 14.2 MB, 0.15–0.32 ms NPU).
++- Eaton, Gaubitch, Moore, Naylor, "Estimation of room acoustic parameters: The ACE Challenge", IEEE/ACM TASLP 2016; ACE results technical report arXiv:1606.03365.
++- Löllmann et al., "Single-channel maximum-likelihood T60 estimation exploiting subband information" (arXiv:1511.04063); Xiong et al., "Joint estimation of RT and DRR from speech using auditory-inspired features" (arXiv:1510.04620).
++- Gamper & Tashev, "Blind reverberation time estimation using a convolutional neural network", IWAENC 2018.
++- "Impulse Response Data Augmentation and DNNs for Blind Room Acoustic Parameter Estimation" (arXiv:1909.03642).
++- "Joint blind room acoustic characterization from speech and music using CRNNs" (arXiv:2010.11167, WASPAA 2021).
++- "Blind estimation of sub-band acoustic parameters from Ambisonics using spectro-spatial covariance features" (arXiv:2411.03172).
++- Bitterman et al., "RevRIR: ... room shape classification" (arXiv:2406.03120, 2024).
++- "Evaluation of Deep Audio Representations for Hearables (DEAR)" (arXiv:2502.06664, 2025).
++- Reddy et al., "Semantic Hearing", UIST 2023 (6.56 ms on a phone).
++- Gergen & Martin, "Reduction of reverberation effects in the MFCC modulation spectrum", Interspeech 2015.
++- This repo: docs/research/pixel-buds-pro-2-mic-2026-09-22.md (bud DSP/paths), docs/research/virtual-room-presets.md (preset side, room-sensing survey).
+diff --git a/docs/research/blind-rt60-room-id-2026-09-28.md b/docs/research/blind-rt60-room-id-2026-09-28.md
+new file mode 100644
+index 00000000..7afb5205
+--- /dev/null
++++ b/docs/research/blind-rt60-room-id-2026-09-28.md
+@@ -0,0 +1,228 @@
++# Blind RT60 / room identification from ambient audio — practical report
++
++Date: 2026-09-28. Scope: Stage 6 environment detection for virtual-room preset selection
++(ADR-0029, roadmap Stage 6). Constraints: totally silent (ambient sound only), on-device on
++Android, phone UNPROCESSED mic array vs Pixel Buds Pro 2 LE-Audio LC3 mic.
++
++## 0. Bottom line
++
++Build a **phone-array, 250 Hz–4 kHz octave-band DSP estimator** (energy-decay-curve + guarded
++free-decay fitting, per-band "no estimate"), plus a **modulation/envelope feature** for steady
++noise, and feed a small classifier. **Do not build the base design on the earbud mic** and
++**do not build the room classifier on RT60 alone** — measured per-class RT60 overlap (below)
++is the same size as the blind estimator's error.
++
++## 1. Two constraints that decide the design
++
++1. **The buds' mic is room ⊗ bud DSP.** Their NS/AGC/AEC runs before the codec; AGC is a
++   time-varying gain that destroys decay slopes and NS gates the tail. This repo already
++   established this (docs/research/pixel-buds-pro-2-mic-2026-09-22.md). Android's
++   UNPROCESSED source is the opposite: CDD 5.11 requires no AGC/NS/AEC and >=60 dB SNR per
++   mic. That is the only capture path that can carry a decay.
++2. **Silent means the source is unknown, so everything is blind.** RT60 is only observable
++   when the ambient field actually contains a decay that ends above the noise floor: speech
++   pauses, footsteps, door/keyboard transients, TV. In a genuinely silent room there is **no
++   excitation and no information** — no method in this report can return an RT60. The honest
++   output is "unknown" and the held/neutral preset, with non-acoustic context (accelerometer,
++   barometer, screen, ANC state) doing the work. Room tone at ~30–45 dB SPL is enough for the
++   modulation features; the decay-fitting methods need transients on top of it.
++
++## 2. Techniques
++
++Accuracy numbers below are from published evaluation sets, mostly **simulated reverberant
++speech**, so treat them as lower bounds on real-world error.
++
++### 2.1 Schroeder backward integration (the definition, not an estimator)
++Computes the energy decay curve (EDC) by integrating the squared impulse response backwards;
++T20/T30 from a line fit and extrapolation to 60 dB. Needs the IR (or a decay-only signal), and
++a fit range of −5…−25 dB (T20) or −5…−35 dB (T30) per ISO 3382-2, so a trustworthy T30 wants
++~45 dB of usable dynamic range. Cost: negligible. Role here: it is the ground-truth definition
++and the correct kernel once a decay segment has been *detected*; it is not itself blind.
++
++### 2.2 Free-decay detection + EDC line fit (Spectral Decay Distribution family)
++Detects candidate decays from log-energy drops, fits a slope, aggregates per band. This is what
++ACE's best single-channel fullband T60 systems did — the 2015 ACE Challenge found the best T60
++estimators were signal-processing approaches, not ML (Bryan 2019, section 1). Published error on
++the ACE evaluation set (reported in Bryan 2019, Table 2): QA-Reverb MSE 0.0648 → **RMSE ≈ 0.255 s**.
++Cost: negligible; a streaming envelope + line fits.
++
++### 2.3 Maximum likelihood over decay-rate statistics
++Ratnam et al. (JASA 2003) and Löllmann & Vary (arXiv:1511.04063, 2015). Model late reverberation
++as a decaying Gaussian process, estimate the decay rate rho by ML over pre-selected frames,
++T60 = 6.908/rho; sub-band estimates are combined energy-weighted, or low bands are extrapolated
++from upper bands. Robust because it estimates a distribution parameter rather than one slope.
++Frames of M = 16 000 samples at 16 kHz (1 s) were found accurate. Cost: low (filterbank +
++per-frame statistics). This is the strongest *classical* blind method.
++
++### 2.4 Spectral decay curve / spectral decay distribution (SDD)
++Histogram of per-frame decay rates in each band; the mode is insensitive to individual bad
++frames. Used in ACE entries (SDD/SDDSA). Cost: low.
++
++### 2.5 Cepstral / spectral-envelope features
++Cepstral peak prominence and similar mainly track STI/clarity, not RT60; they are weak and
++source-dependent. Not recommended for RT60.
++
++### 2.6 Modulation / envelope-based (MTF, SRMR, envelope modulation spectrum)
++Estimates how the source's amplitude modulation (2–8 Hz) is smeared, which is a function of
++reverberation. Works on **continuous** sound, so it is the only family that still works when
++the room is quiet-but-steady with no clean decays. Non-intrusive (blind) STI estimation from
++reverberant speech exists. Cost: low (envelope + modulation filterbank). Use as the fallback
++feature, not as the primary RT60.
++
++### 2.7 Neural / ML (2020+), single channel, no known excitation
++| System | Input | Published accuracy |
++|---|---|---|
++| Gamper & Tashev CNN (IWAENC 2018), re-scored on ACE | 4 s speech | MSE 0.0384 → **RMSE ≈ 0.196 s**, bias +0.030 s, rho 0.836 |
++| Bryan, AIR augmentation + CNN (arXiv:1909.03642, 2019) | 4 s speech | MSE 0.0261 → **RMSE ≈ 0.162 s**, bias −0.026 s, rho 0.920 |
++| CNN-encoder (Interspeech 2020 / TU Delft) | RIR / speech | MSE 0.0006 s² on clean RIRs (**RMSE 0.024 s**), 0.0011 s² at +30 dB SNR (0.033 s), **0.0282 s² on real recordings (RMSE 0.168 s)** |
++| Universal CRNN (Peso Parada et al., arXiv:2109.14436, 2021) | 8 s speech, SNR −5…24 dB, 369 K params | T60 **MAE 0.21 s**; DRR MAE 2.91 dB; C50 MAE 5.95 dB |
++| Götz et al., dynamic conditions (arXiv:2202.11790, 2022) | 4 s speech | static test MSE 0.0219 → RMSE 0.148 s, MAPE 18.9 % |
++| Ick et al., phase features (arXiv:2303.07449, 2023) | noisy speech | RT60 rho 0.946 (joint); normalized MSE 0.1408 |
++| Contrastive representation (arXiv:2302.11205, 2023) | speech | RT60 **RMSE 0.223 s** |
++| SS-BRPE, self-supervised attention (arXiv:2409.05212, 2024) | noisy speech, RT60 0.41–19.68 s | linear **MAE 0.39 s**, median abs 0.08 s, rho 0.972 |
++
++Reading: the modern nets are in the **0.13–0.25 s RMSE** band on speech corpora, and ~0.17 s on
++the one real-recorded test above. They beat the classical methods by ~0.05–0.1 s RMSE, not by an
++order of magnitude.
++
++## 3. Failure mode of naive free-decay fitting, and the guards
++
++**Failure mode.** The EDC of a real signal is not a straight line: it is a decay that bends into
++the noise floor. Fit a line over the whole thing and the floor drags the slope toward zero —
++because T60 = 6.908/rho, a slope that is only 0.5x too small returns an RT60 that is **2x too
++long**. In a quiet room with no real decay, you are fitting noise-floor fluctuations, rho ≈ 0, and
++the estimate diverges (bounded only by your clamp); a naive implementation on a 1 s window 20 dB
++above the floor readily returns 3–10 s for a 0.4 s room.
++
++**Guards that make it trustworthy** (1–4 are published practice, 5–9 are the thresholds I would set):
++
++1. **Fit range, not full range.** Fit only where the EDC is between −5 dB and
++   max(−35 dB, noise-floor + 5 dB). ISO 3382-2 evaluation ranges: T20 −5…−25 dB, T30 −5…−35 dB.
++2. **Noise-floor truncation.** Estimate the floor from the tail and truncate the fit iteratively
++   (Lundeby et al. method). Without this the slope is biased low, and the bias grows as SNR drops.
++3. **Minimum decay depth.** Require >= 15 dB (T20-equivalent) or >= 25 dB (T30-equivalent) of
++   usable range in the segment; else discard the segment.
++4. **SNR gate.** Require the late-reverb-to-noise ratio >= 15 dB. ACE's own noise sweep had
++   conditions at 18, 12 and −1 dB; at −1 dB every published system degrades sharply.
++5. **Minimum number of segments.** >= 8–20 independent decays per band per aggregation window
++   before that band is "decided".
++6. **Aggregate by median, not mean.** Per-segment T60 estimates have a heavy right tail (the
++   divergence above); the median over segments is the estimator, the mean is not.
++7. **Consistency check.** R² >= 0.98 in the log domain over the fit range, and require
++   |T30 − T20| / T20 <= 0.10. If T30 >> T20, the fit hit the floor — discard.
++8. **Band-limit.** Decide only in 250 Hz–4 kHz octave bands (or 1/3-octave 500 Hz–4 kHz) that
++   carry >= 10 dB more energy than the inter-band floor. Below 250 Hz you measure HVAC rumble and
++   phone handling; above 4 kHz you measure air absorption, the mic response and the codec.
++9. **Clamp and refuse.** Clamp to [0.05, 2.5] s and emit "no estimate" when any guard fails.
++   Missing is a first-class input to the classifier, not a value to impute.
++
++## 4. Which features actually separate the five classes
++
++Measured anchors from the repo's own analysis of the MIT IR Survey (Traer & McDermott 2016),
++median T20-equivalent RT60 at 250 Hz / 1 kHz / 4 kHz, in docs/research/virtual-room-presets.md section 5.1:
++
++| Class | RT60 250 / 1k / 4k (s) | Note |
++|---|---|---|
++| Bedroom | 0.29 / 0.30 / 0.27 | |
++| Living room | 0.33 / 0.32 / 0.27 | |
++| Classroom | 0.52 / 0.37 / 0.23 | |
++| Train carriage | 0.43 / 0.25 / 0.31 | |
++| Subway station | 1.34 / 0.72 / 0.49 | long space |
++| Outside | 0.06 / 0.04 / 0.02 | DRR ≈ +13 dB; essentially no tail |
++
++**Consequence:** RT60 separates *outside* (trivially) and *station*; bedroom / living room /
++classroom / train sit within 0.25–0.5 s of each other, i.e. **inside the error bar of the best
++blind estimators**. This is also why the repo already decided bedroom and living room are one
++class ("home", section 5.1 lines 419-420). The deliverable is effectively **4 classes: home,
++classroom, train, outside/street**.
++
++Feature ranking for those classes:
++1. **Background noise: level, band shape and temporal structure.** Train = broadband LF rumble
++   plus periodic 1–3 Hz vibration; classroom = speech babble; living room = TV/music; outside =
++   wind/traffic/birds with no tail. This is a scene-classification problem and the strongest
++   single signal — YAMNet-class TFLite on the phone mic, already the Stage 6 plan.
++2. **RT60 per band, when it is available at all** — it is the only feature that identifies
++   *outside* and the only one that scales the room *size*.
++3. **DRR.** The most discriminative *acoustic* parameter (outside +13 dB, train ≈ −6 dB), but
++   blind DRR error is ~2.9 dB (CRNN above) and absolute DRR needs a source-distance assumption
++   that ambient audio does not give you. Use as a weak feature.
++4. **RT_4k / RT_1k ratio** (air + surface absorption): MIT medians give 0.84 living room, 0.62
++   classroom — plausible but high-variance.
++5. **Modulation depth** (2–8 Hz MTF): the fallback when there are no clean decays.
++6. **C50 / EDT:** ~5.9 dB MAE blind and strongly correlated with DRR and RT60; adds little.
++7. **Inter-channel coherence on the phone's 2-mic array:** ~15 cm spacing is unambiguous only
++   below ≈ c/2d ≈ 1.1 kHz, and hand/body occlusion is uncontrolled. Second-order feature.
++8. Earbud IMU head orientation: irrelevant to room identity; phone accelerometer and barometer
++   are the useful non-acoustic inputs (already Stage 6).
++
++## 5. Minimum audio duration
++
++- One decay: you must observe >= 20–30 dB of decay; for RT60 = 0.5 s that is 0.17–0.25 s, plus
++  the segment context.
++- Published inputs: ML estimates from 1 s frames (Löllmann & Vary); Gamper's CNN produces one
++  estimate from a **4 s** sample; the universal CRNN uses **8 s** chunks; the ACE analysis
++  compares utterances **<15 s vs >=15 s** and finds lower error for the longer ones.
++- Practical target: accumulate a **20–30 s window containing >= 10 decays per band**, which in a
++  room with a TV or conversation converges in **30–60 s**; a ±0.1 s stable estimate needs roughly
++  **1–3 minutes** of ordinary activity. Because RT60 is a stationary property, collect it
++  opportunistically in the first few minutes of a session and refresh every few minutes rather
++  than running continuously.
++- Genuinely silent room: **no duration helps.** Return "unknown".
++
++## 6. On-device cost (Pixel 9 Pro XL class)
++
++| Component | Compute | Memory |
++|---|---|---|
++| 6-band octave filterbank + 100 Hz envelope + streaming EDC/segment detection | ~3–10 MFLOP/s, well under 1 % of one big core | < 1 MB (band envelopes + rolling energy window) |
++| ML T60, small CNN/CRNN | 369 K params (CRNN, arXiv:2109.14436) to 1.66 M (CNN baseline); ~10–100 MFLOPs per 4–8 s window → a few ms to ~30 ms per inference int8 | 1.5–7 MB fp32 per 0.4–1.7 M params, /4 with int8 |
++| Attention model (SS-BRPE class) | larger; only worth it if measured | 10–25 MB+ typical |
++| YAMNet-class scene tagger (Stage 6 plan) | existing plan, 16 kHz mono, duty-cycled | existing plan |
++
++These are estimates from published parameter counts and generic mobile inference, not device
++measurements. For scale, this repo already measured the whole app process at 0.805 of a core
++and the render at ~0.10 core on the Pixel 7a, and set a "CPU is measured on device" rule — so
++the DSP path is comfortably free and the net must be duty-cycled.
++
++## 7. One extra option: the excitation that already exists
++
++The app knows exactly what it is playing. The phone's UNPROCESSED mics hear the music leaking
++from the in-ear buds; cross-correlating the app's own reference signal with that capture
++recovers a **true room IR with no sound added to the room**, which yields absolute DRR, C50 and
++RT60 rather than RT60 alone. Caveats: in-ear Buds leak very little (expect roughly −30 to
++−50 dB; must be measured on the device), the phone may be in a pocket, and it works only while
++music plays — which is exactly the case where ambient excitation is weakest. Worth one
++measurement spike; not a base design.
++
++## 8. Build order
++
++1. Phone array, UNPROCESSED, mono (or the less-occluded channel), 250 Hz–4 kHz octave bands;
++   EDC + guarded free-decay fitting (section 3) with per-band "no estimate".
++2. Modulation/envelope features (2–8 Hz) as the steady-noise fallback.
++3. A small classifier (logistic regression / GBM) over: RT60 per band *if available*,
++   RT_4k/RT_1k, a DRR proxy, noise band levels + their temporal variance, modulation depth,
++   accelerometer/barometer. Plus YAMNet for the semantic noise class. Four classes: home,
++   classroom, train, outside.
++4. Only then a TFLite T60 net as an auxiliary feature — its real-recording error (~0.17–0.25 s)
++   is the same order as the DSP estimator's.
++5. Earbuds: not for decays. At most the already-known MAESTRO Dosimeter.SubscribeToLiveDb
++   level scalar as a non-decay level feature.
++
++## Sources
++
++- Eaton et al., "Estimation of room acoustic parameters: the ACE Challenge", IEEE/ACM TASLP 24(10), 2016; results report arXiv:1606.03365.
++- Ratnam et al., "Blind estimation of reverberation time", JASA 114(5), 2003.
++- Löllmann & Vary, "Single-channel maximum-likelihood T60 estimation exploiting subband information", arXiv:1511.04063, 2015.
++- Gamper & Tashev, "Blind reverberation time estimation using a convolutional neural network", IWAENC 2018.
++- Bryan, "Impulse response data augmentation and deep neural networks for blind room acoustic parameter estimation", arXiv:1909.03642, 2019.
++- "Blind reverberation time estimation using a convolutional neural network with encoder", Interspeech 2020 / TU Delft.
++- Peso Parada et al., "A universal deep room acoustics estimator", arXiv:2109.14436, 2021.
++- Zheng et al., "Noise-robust blind reverberation time estimation using noise-aware time–frequency masking", Measurement, 2022 (arXiv:2112.04726).
++- Götz et al., "Blind reverberation time estimation in dynamic acoustic conditions", arXiv:2202.11790, 2022.
++- Ick, Mehrabi & Jin, "Blind acoustic room parameter estimation using phase features", arXiv:2303.07449, 2023.
++- "Contrastive representation learning for acoustic parameter estimation", arXiv:2302.11205, 2023.
++- Wang et al., "SS-BRPE: self-supervised blind room parameter estimation using attention mechanisms", arXiv:2409.05212, 2024.
++- Traer & McDermott, "Statistics of natural reverberation enable perceptual separation of sound and space", PNAS 2016 (MIT IR Survey).
++- ISO 3382-2, "Measurement of room acoustic parameters — Part 2: Reverberation time in ordinary rooms".
++- Lundeby et al., "Uncertainties of measurements in room acoustics", Acustica 81, 1995.
++- AOSP Compatibility Definition Document section 5.11, "Capture for unprocessed audio".
++- In-repo: docs/research/virtual-room-presets.md, docs/research/pixel-buds-pro-2-mic-2026-09-22.md, ADR-0017, ADR-0029.
+-- 
+2.56.0
+

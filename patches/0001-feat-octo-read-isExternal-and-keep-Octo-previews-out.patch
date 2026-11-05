@@ -1,0 +1,413 @@
+From 0e5957e19541e61e9c2e401c4ca0e9b3c1323f2e Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Tue, 3 Nov 2026 19:40:38 -0500
+Subject: [PATCH] feat(octo): read isExternal and keep Octo previews out of
+ downloads and playlists
+
+Octo marks songs it does not own yet (YouTube previews) with isExternal. The app ignored it, so
+previews were downloaded by the keep-downloaded sync and could be added to server playlists.
+Now: parsed into ProviderSong/StreamingSong (+ catalog cache), never queued for download (manual or
+keep-downloaded), refused for playlist adds.
+---
+ .../data/provider/StreamingProviderModels.kt  |   7 +-
+ .../data/provider/SubsonicApiClient.kt        |   3 +-
+ .../data/repository/CatalogCacheCodec.kt      |   6 +-
+ .../StreamingMusicRepositoryImpl.kt           |   1 +
+ .../streaming/domain/model/StreamingSong.kt   |   4 +-
+ .../viewmodel/StreamingMusicViewModel.kt      |  12 +-
+ .../rhythm/app/offline/DownloadEligibility.kt |  22 +++
+ .../rhythm/app/offline/OfflineWiring.kt       |   2 +-
+ .../chromahub/rhythm/app/offline/PinSync.kt   |   4 +-
+ .../data/provider/SubsonicIsExternalTest.kt   | 142 ++++++++++++++++++
+ .../app/offline/DownloadEligibilityTest.kt    |  39 +++++
+ 11 files changed, 234 insertions(+), 8 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/offline/DownloadEligibility.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/offline/DownloadEligibilityTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
+index 3454b49f..d2a9d4e3 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/StreamingProviderModels.kt
+@@ -51,7 +51,12 @@ data class ProviderSong(
+      * Fork (OpenSubsonic): the server's exact display credit ("Kanye West feat. Jay-Z"), kept for
+      * display. Grouping never parses this string when [artistRefs] is present.
+      */
+-    val displayArtist: String? = null
++    val displayArtist: String? = null,
++    /**
++     * Fork (Octo): a preview the proxy does not own yet (`isExternal: true`). It plays, but it is not a library
++     * song: it is never downloaded or added to a playlist until starring it has made Octo grab it.
++     */
++    val isExternal: Boolean = false
+ )
+ 
+ /**
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 93cb8606..5434fdfe 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -1163,7 +1163,8 @@ class SubsonicApiClient internal constructor(
+             isSpatialCompanion = companion,
+             artistId = song.optString("artistId", "").takeIf { it.isNotBlank() },
+             artistRefs = artistRefs,
+-            displayArtist = song.optString("displayArtist", "").takeIf { it.isNotBlank() }
++            displayArtist = song.optString("displayArtist", "").takeIf { it.isNotBlank() },
++            isExternal = song.opt("isExternal") == true // Fork (Octo)
+         )
+     }
+ 
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/CatalogCacheCodec.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/CatalogCacheCodec.kt
+index dbc0aaca..a8cb0d84 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/CatalogCacheCodec.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/CatalogCacheCodec.kt
+@@ -118,6 +118,7 @@ internal class CatalogCacheCodec(private val urlRefs: CatalogUrlRefs = CatalogUr
+             song.channels?.let { out.name("ch").value(it) }
+             song.codec?.let { out.name("c").value(it) }
+             if (song.isSpatialCompanion) out.name("sc").value(true)
++            if (song.isExternal) out.name("ex").value(true)
+             out.endObject()
+         }
+ 
+@@ -132,6 +133,7 @@ internal class CatalogCacheCodec(private val urlRefs: CatalogUrlRefs = CatalogUr
+             var genre: String? = null; var bitrate: Int? = null; var sampleRate: Int? = null
+             var channels: Int? = null; var codec: String? = null; var compact = false
+             var isSpatialCompanion = false
++            var isExternal = false
+ 
+             reader.beginObject()
+             while (reader.hasNext()) {
+@@ -168,6 +170,7 @@ internal class CatalogCacheCodec(private val urlRefs: CatalogUrlRefs = CatalogUr
+                     "ch", "channels" -> channels = reader.nextInt()
+                     "c", "codec" -> codec = reader.nextString()
+                     "sc", "isSpatialCompanion" -> isSpatialCompanion = reader.nextBoolean()
++                    "ex", "isExternal" -> isExternal = reader.nextBoolean()
+                     else -> reader.skipValue()
+                 }
+             }
+@@ -202,7 +205,8 @@ internal class CatalogCacheCodec(private val urlRefs: CatalogUrlRefs = CatalogUr
+                 sampleRate = sampleRate,
+                 channels = channels,
+                 codec = codec,
+-                isSpatialCompanion = isSpatialCompanion
++                isSpatialCompanion = isSpatialCompanion,
++                isExternal = isExternal
+             )
+         }
+     }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+index d836162f..04dbc73c 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+@@ -2513,6 +2513,7 @@ class StreamingMusicRepositoryImpl(
+             channels = providerSong.channels,
+             codec = providerSong.codec,
+             isSpatialCompanion = providerSong.isSpatialCompanion,
++            isExternal = providerSong.isExternal,
+             artistId = providerSong.artistId,
+             artistRefs = providerSong.artistRefs,
+             displayArtist = providerSong.displayArtist,
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingSong.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingSong.kt
+index d0a1b45c..c4f91fb9 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingSong.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/domain/model/StreamingSong.kt
+@@ -50,7 +50,9 @@ data class StreamingSong(
+     val artistId: String? = null,
+     val artistRefs: List<chromahub.rhythm.app.features.streaming.data.provider.ArtistRef> = emptyList(),
+     /** Fork (OpenSubsonic): the server's display credit, kept verbatim for display. */
+-    val displayArtist: String? = null
++    val displayArtist: String? = null,
++    /** Fork (Octo): a preview the proxy does not own yet; see [chromahub.rhythm.app.offline.DownloadEligibility]. */
++    val isExternal: Boolean = false
+ ) : PlayableItem {
+     
+     override fun getPlaybackUri(): String = streamingUrl ?: previewUrl ?: ""
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+index d626440c..6fd65abc 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+@@ -1857,6 +1857,10 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+      * Add a song to a playlist.
+      */
+     fun addSongToPlaylist(playlistId: String, song: StreamingSong) {
++        if (!chromahub.rhythm.app.offline.DownloadEligibility.isDownloadable(song)) {
++            showToast("Heart it first so Octo can add it to your library")
++            return
++        }
+         viewModelScope.launch {
+             try {
+                 repository.addSongsToPlaylist(playlistId, listOf(song.id))
+@@ -1871,7 +1875,13 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+      * Add multiple songs to a playlist.
+      */
+     fun addSongsToPlaylist(playlistId: String, songs: List<StreamingSong>) {
+-        if (songs.isEmpty()) return
++        val (allowed, refused) = chromahub.rhythm.app.offline.DownloadEligibility.splitForPlaylist(songs)
++        if (refused.isNotEmpty()) showToast("Skipped ${refused.size} preview song(s): heart them first so Octo can add them to your library")
++        if (allowed.isEmpty()) return
++        addAllowedSongsToPlaylist(playlistId, allowed)
++    }
++
++    private fun addAllowedSongsToPlaylist(playlistId: String, songs: List<StreamingSong>) {
+ 
+         viewModelScope.launch {
+             try {
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/DownloadEligibility.kt b/app/src/main/java/chromahub/rhythm/app/offline/DownloadEligibility.kt
+new file mode 100644
+index 00000000..1a8721cd
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/offline/DownloadEligibility.kt
+@@ -0,0 +1,22 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.offline
++
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingSong
++
++/**
++ * Fork (Octo): which songs may be kept on the device or put in a server playlist. An Octo preview
++ * ([StreamingSong.isExternal]) is a YouTube stream the proxy does not own yet: downloading it would store a
++ * preview-grade copy under an id that stops existing once Octo grabs the real file, and a playlist entry
++ * would point at that id. Starring the preview is what makes Octo grab it; after the rescan it is an ordinary
++ * library song and passes both checks.
++ */
++object DownloadEligibility {
++    fun isDownloadable(song: StreamingSong): Boolean = !song.isExternal
++
++    fun downloadable(songs: List<StreamingSong>): List<StreamingSong> = songs.filter(::isDownloadable)
++
++    /** Songs that may join a playlist, and the ones refused (previews). */
++    fun splitForPlaylist(songs: List<StreamingSong>): Pair<List<StreamingSong>, List<StreamingSong>> =
++        songs.partition(::isDownloadable)
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/OfflineWiring.kt b/app/src/main/java/chromahub/rhythm/app/offline/OfflineWiring.kt
+index dda4845e..fee06920 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/OfflineWiring.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/OfflineWiring.kt
+@@ -301,7 +301,7 @@ object OfflineWiring {
+     fun enqueue(context: Context, songs: List<StreamingSong>): Int {
+         if (app == null) install(context.applicationContext as Application)
+         val queued = store.enqueueAll(
+-            songs.map { song ->
++            DownloadEligibility.downloadable(songs).map { song -> // Fork (Octo): never a preview
+                 DownloadItem(
+                     songId = song.id,
+                     title = song.title,
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+index 484dcf3b..21f2bc27 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+@@ -111,7 +111,7 @@ object PinSync {
+         val songs = HashMap<String, StreamingSong>()
+ 
+         if (settings.keepFavorites.value) {
+-            val starred = repo.fetchStarredForPins()
++            val starred = repo.fetchStarredForPins().map { DownloadEligibility.downloadable(it) } // Fork (Octo): never a preview
+             starred.getOrNull()?.forEach { songs[it.id] = it }
+             sources[PinSource.FAVORITES] = SourceState.of(starred.map { list -> list.map { it.id } })
+         }
+@@ -126,7 +126,7 @@ object PinSync {
+         for ((name, playlists) in selection.fetch) {
+             // Playlists that share a name are one source: the union of their songs.
+             val parts = playlists.map { playlist ->
+-                val fetched = repo.fetchPlaylistSongsForPins(playlist.id)
++                val fetched = repo.fetchPlaylistSongsForPins(playlist.id).map { DownloadEligibility.downloadable(it) }
+                 fetched.getOrNull()?.forEach { songs[it.id] = it }
+                 SourceState.of(fetched.map { list -> list.map { it.id } }, playlist.songCount)
+             }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
+new file mode 100644
+index 00000000..5b020bfa
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
+@@ -0,0 +1,142 @@
++/*
++ * SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++package chromahub.rhythm.app.features.streaming.data.provider
++
++import android.content.Context
++import android.content.ContextWrapper
++import android.content.SharedPreferences
++import kotlinx.coroutines.runBlocking
++import mockwebserver3.Dispatcher
++import mockwebserver3.MockResponse
++import mockwebserver3.MockWebServer
++import mockwebserver3.RecordedRequest
++import okhttp3.OkHttpClient
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.TimeUnit
++
++/**
++ * Octo (a Subsonic proxy in front of Navidrome) marks a song, album or artist it does not own yet with
++ * `isExternal: true`: a YouTube preview that becomes a Navidrome song only after the user stars it. The app
++ * must see the flag, or a preview is treated as a library song (downloaded, put in playlists).
++ */
++class SubsonicIsExternalTest {
++
++    private lateinit var server: MockWebServer
++
++    @Before
++    fun setUp() {
++        server = MockWebServer()
++        server.dispatcher = object : Dispatcher() {
++            override fun dispatch(request: RecordedRequest): MockResponse {
++                return when (request.url.encodedPath) {
++                    "/rest/getAlbum.view" -> ok(",\"album\":{\"id\":\"al-1\",\"name\":\"Watch the Throne\",\"song\":[$SONGS]}")
++                    else -> ok()
++                }
++            }
++        }
++        server.start()
++    }
++
++    @After
++    fun tearDown() {
++        server.close()
++    }
++
++    private fun ok(fields: String = "") = MockResponse.Builder()
++        .body("""{"subsonic-response":{"status":"ok","version":"1.16.1"$fields}}""")
++        .build()
++
++    private fun client(): SubsonicApiClient {
++        val client = SubsonicApiClient(
++            FakeContext(),
++            OkHttpClient.Builder().readTimeout(2, TimeUnit.SECONDS).build(),
++            libraryFetchRetryDelayMs = 10
++        )
++        val login = runBlocking { client.login(server.url("/").toString(), "user", "secret", saveCredentials = false) }
++        assertTrue("login failed: ${login.exceptionOrNull()}", login.isSuccess)
++        return client
++    }
++
++    private fun songsById(): Map<String, ProviderSong> =
++        runBlocking { client().getLibraryAlbumSongs("al-1") }.getOrThrow().associateBy { it.providerId }
++
++    @Test
++    fun aSongOctoMarksExternalIsExternal() {
++        assertTrue(songsById().getValue("preview").isExternal)
++    }
++
++    @Test
++    fun aSongOctoMarksNotExternalIsNot() {
++        assertFalse(songsById().getValue("owned").isExternal)
++    }
++
++    @Test
++    fun aServerThatSendsNoFlagMeansOwned() {
++        assertFalse(songsById().getValue("plain").isExternal)
++    }
++
++    @Test
++    fun aFlagOfTheWrongTypeIsIgnored() {
++        assertFalse(songsById().getValue("weird").isExternal)
++    }
++
++    private companion object {
++        val SONGS = """
++            {"id":"preview","title":"P","artist":"A","album":"B","duration":100,"isExternal":true},
++            {"id":"owned","title":"O","artist":"A","album":"B","duration":100,"isExternal":false},
++            {"id":"plain","title":"N","artist":"A","album":"B","duration":100},
++            {"id":"weird","title":"W","artist":"A","album":"B","duration":100,"isExternal":"yes"}
++        """.trimIndent()
++    }
++
++    private class FakeContext : ContextWrapper(null) {
++        private val prefs = FakeSharedPreferences()
++        override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences = prefs
++    }
++
++    private class FakeSharedPreferences : SharedPreferences {
++        private val values = ConcurrentHashMap<String, Any>()
++
++        override fun getAll(): Map<String, *> = values
++        override fun getString(key: String, defValue: String?) = values[key] as? String ?: defValue
++        override fun getStringSet(key: String, defValues: Set<String>?) =
++            @Suppress("UNCHECKED_CAST") (values[key] as? Set<String> ?: defValues)
++        override fun getInt(key: String, defValue: Int) = values[key] as? Int ?: defValue
++        override fun getLong(key: String, defValue: Long) = values[key] as? Long ?: defValue
++        override fun getFloat(key: String, defValue: Float) = values[key] as? Float ?: defValue
++        override fun getBoolean(key: String, defValue: Boolean) = values[key] as? Boolean ?: defValue
++        override fun contains(key: String) = values.containsKey(key)
++        override fun registerOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
++        override fun unregisterOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
++
++        override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
++            private val pending = HashMap<String, Any?>()
++            private var clear = false
++            override fun putString(key: String, value: String?) = apply { pending[key] = value }
++            override fun putStringSet(key: String, values: Set<String>?) = apply { pending[key] = values }
++            override fun putInt(key: String, value: Int) = apply { pending[key] = value }
++            override fun putLong(key: String, value: Long) = apply { pending[key] = value }
++            override fun putFloat(key: String, value: Float) = apply { pending[key] = value }
++            override fun putBoolean(key: String, value: Boolean) = apply { pending[key] = value }
++            override fun remove(key: String) = apply { pending[key] = null }
++            override fun clear() = apply { clear = true }
++            override fun commit(): Boolean {
++                apply()
++                return true
++            }
++            override fun apply() {
++                if (clear) values.clear()
++                pending.forEach { (key, value) -> if (value == null) values.remove(key) else values[key] = value }
++            }
++        }
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/offline/DownloadEligibilityTest.kt b/app/src/test/java/chromahub/rhythm/app/offline/DownloadEligibilityTest.kt
+new file mode 100644
+index 00000000..61a72c7a
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/offline/DownloadEligibilityTest.kt
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.offline
++
++import chromahub.rhythm.app.core.domain.model.SourceType
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingSong
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** An Octo preview is a YouTube stream, not the song: it is never kept on the device or put in a playlist. */
++class DownloadEligibilityTest {
++
++    private fun song(id: String, external: Boolean) = StreamingSong(
++        id = id, title = id, artist = "a", album = "b", duration = 1000L, artworkUri = null,
++        sourceType = SourceType.SUBSONIC, streamingUrl = null, previewUrl = null, isExternal = external,
++    )
++
++    @Test
++    fun aLibrarySongIsDownloadable() = assertTrue(DownloadEligibility.isDownloadable(song("1", external = false)))
++
++    @Test
++    fun anExternalPreviewIsNot() = assertFalse(DownloadEligibility.isDownloadable(song("2", external = true)))
++
++    @Test
++    fun filterKeepsOnlyLibrarySongsInOrder() {
++        val all = listOf(song("1", false), song("2", true), song("3", false))
++        assertEquals(listOf("1", "3"), DownloadEligibility.downloadable(all).map { it.id })
++    }
++
++    @Test
++    fun onlyLibrarySongsMayJoinAPlaylist() {
++        val all = listOf(song("1", false), song("2", true))
++        val (allowed, refused) = DownloadEligibility.splitForPlaylist(all)
++        assertEquals(listOf("1"), allowed.map { it.id })
++        assertEquals(listOf("2"), refused.map { it.id })
++    }
++}
+-- 
+2.56.0
+

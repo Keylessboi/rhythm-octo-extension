@@ -1,0 +1,170 @@
+From 87ee3be0c05bcfa44a37f0ac28d5e05b003eff3b Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Tue, 3 Nov 2026 19:52:45 -0500
+Subject: [PATCH] feat(octo): recognise Octo previews by the shape Octo gives
+ them
+
+Octo sends isExternal=false on every song, so the flag never fired for previews. A song is now a
+preview when its path is exactly {artist}/{album}/{title}.{suffix} and it has Octo's estimated bitrate
+(128 or 950 kbps) at a fixed 44.1 kHz; a real file's own path/bitrate/rate never all match.
+---
+ .../data/provider/OctoPreviewSignature.kt     | 30 +++++++++++
+ .../data/provider/SubsonicApiClient.kt        | 12 ++++-
+ .../data/provider/OctoPreviewSignatureTest.kt | 50 +++++++++++++++++++
+ .../data/provider/SubsonicIsExternalTest.kt   | 16 +++++-
+ 4 files changed, 106 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignature.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignatureTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignature.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignature.kt
+new file mode 100644
+index 00000000..cf232d2d
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignature.kt
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.streaming.data.provider
++
++/**
++ * Fork (Octo): recognises a song Octo only previews. Octo sends it as an ordinary song and hardcodes
++ * `isExternal=false` on every song it renders (octo `SubsonicResponseBuilder.cs`), so the flag cannot be trusted.
++ * What Octo builds for a preview is a fixed shape: `path` = `{artist}/{album}/{title}.{suffix}`, an estimated
++ * bitrate (128 kbps m4a, or 950 kbps flac while it waits for lossless) and a fixed 44.1 kHz. A real Navidrome file
++ * has its real path (track number, disc folders), its real bitrate and its own sample rate, so all four must match
++ * before a song is called a preview: a false match would keep a real song out of the downloads.
++ */
++object OctoPreviewSignature {
++    private val ESTIMATED_KBPS = setOf(128, 950)
++    private const val FIXED_SAMPLING_RATE = 44100
++
++    fun isPreview(
++        artist: String,
++        album: String,
++        title: String,
++        suffix: String?,
++        bitRateKbps: Int,
++        samplingRate: Int,
++        path: String?,
++    ): Boolean {
++        if (path.isNullOrBlank() || suffix.isNullOrBlank()) return false
++        if (bitRateKbps !in ESTIMATED_KBPS || samplingRate != FIXED_SAMPLING_RATE) return false
++        return path.equals("$artist/$album/$title.$suffix", ignoreCase = true)
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 5434fdfe..4a44597c 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -1164,7 +1164,17 @@ class SubsonicApiClient internal constructor(
+             artistId = song.optString("artistId", "").takeIf { it.isNotBlank() },
+             artistRefs = artistRefs,
+             displayArtist = song.optString("displayArtist", "").takeIf { it.isNotBlank() },
+-            isExternal = song.opt("isExternal") == true // Fork (Octo)
++            // Fork (Octo): the flag is honoured where a server sets it, but Octo sends false for its previews, so
++            // they are also recognised by the shape Octo gives them (see OctoPreviewSignature).
++            isExternal = song.opt("isExternal") == true || OctoPreviewSignature.isPreview(
++                artist = song.optString("artist", "Unknown artist"),
++                album = song.optString("album", "Unknown album"),
++                title = song.optString("title", song.optString("name", "Unknown title")),
++                suffix = codecVal,
++                bitRateKbps = song.optInt("bitRate", 0),
++                samplingRate = song.optInt("samplingRate", song.optInt("sampleRate", 0)),
++                path = song.optString("path", "").takeIf { it.isNotBlank() },
++            )
+         )
+     }
+ 
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignatureTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignatureTest.kt
+new file mode 100644
+index 00000000..0926fa03
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/OctoPreviewSignatureTest.kt
+@@ -0,0 +1,50 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.streaming.data.provider
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Octo renders a preview as an ordinary song and hardcodes `isExternal=false` (SubsonicResponseBuilder.cs). What it
++ * does not fake is the combination below: a path it builds as `{artist}/{album}/{title}.{suffix}`, the estimated
++ * 128 kbps m4a (or 950 kbps flac when it waits for lossless), and a fixed 44.1 kHz. A real Navidrome file has
++ * its real path (track number, disc folder), its real bitrate and its own sample rate.
++ */
++class OctoPreviewSignatureTest {
++
++    private fun sig(
++        artist: String = "Phoebe Bridgers", album: String = "Lost Weekend", title: String = "Bobby",
++        suffix: String? = "m4a", bitRateKbps: Int = 128, samplingRate: Int = 44100,
++        path: String? = "Phoebe Bridgers/Lost Weekend/Bobby.m4a",
++    ) = OctoPreviewSignature.isPreview(artist, album, title, suffix, bitRateKbps, samplingRate, path)
++
++    @Test
++    fun anOctoPreviewMatches() = assertTrue(sig())
++
++    @Test
++    fun aLosslessWaitingPreviewMatches() = assertTrue(
++        sig(suffix = "flac", bitRateKbps = 950, path = "Phoebe Bridgers/Lost Weekend/Bobby.flac"),
++    )
++
++    @Test
++    fun aRealLibraryM4aWithItsOwnPathDoesNot() = assertFalse(
++        sig(path = "Phoebe Bridgers/Lost Weekend/03 - Bobby.m4a"),
++    )
++
++    @Test
++    fun aRealLibraryFileAt128kbpsWithAMatchingPathButAnotherSampleRateDoesNot() = assertFalse(sig(samplingRate = 48000))
++
++    @Test
++    fun aMatchingPathAtAnotherBitrateDoesNot() = assertFalse(sig(bitRateKbps = 256))
++
++    @Test
++    fun noPathMeansNoMatch() = assertFalse(sig(path = null))
++
++    @Test
++    fun theComparisonIgnoresCaseOnly() {
++        assertTrue(sig(path = "phoebe bridgers/lost weekend/bobby.M4A"))
++        assertFalse(sig(path = "Phoebe Bridgers/Lost Weekend/Haunted.m4a"))
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
+index 5b020bfa..9f6f1456 100644
+--- a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicIsExternalTest.kt
+@@ -84,6 +84,16 @@ class SubsonicIsExternalTest {
+         assertFalse(songsById().getValue("plain").isExternal)
+     }
+ 
++    @Test
++    fun anOctoPreviewThatClaimsToBeOwnedIsStillSeenAsExternal() {
++        assertTrue(songsById().getValue("octo").isExternal)
++    }
++
++    @Test
++    fun aRealLibrarySongWithTheSameTagsIsNot() {
++        assertFalse(songsById().getValue("real").isExternal)
++    }
++
+     @Test
+     fun aFlagOfTheWrongTypeIsIgnored() {
+         assertFalse(songsById().getValue("weird").isExternal)
+@@ -94,7 +104,11 @@ class SubsonicIsExternalTest {
+             {"id":"preview","title":"P","artist":"A","album":"B","duration":100,"isExternal":true},
+             {"id":"owned","title":"O","artist":"A","album":"B","duration":100,"isExternal":false},
+             {"id":"plain","title":"N","artist":"A","album":"B","duration":100},
+-            {"id":"weird","title":"W","artist":"A","album":"B","duration":100,"isExternal":"yes"}
++            {"id":"weird","title":"W","artist":"A","album":"B","duration":100,"isExternal":"yes"},
++            {"id":"octo","title":"Bobby","artist":"Phoebe Bridgers","album":"Lost Weekend","duration":100,"isExternal":false,
++             "suffix":"m4a","bitRate":128,"samplingRate":44100,"path":"Phoebe Bridgers/Lost Weekend/Bobby.m4a"},
++            {"id":"real","title":"Bobby","artist":"Phoebe Bridgers","album":"Lost Weekend","duration":100,"isExternal":false,
++             "suffix":"m4a","bitRate":128,"samplingRate":44100,"path":"Phoebe Bridgers/Lost Weekend/03 - Bobby.m4a"}
+         """.trimIndent()
+     }
+ 
+-- 
+2.56.0
+

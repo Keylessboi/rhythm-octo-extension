@@ -1,0 +1,456 @@
+From 3897a994d6dad4f722cb6be82eb26ddd413d9c0f Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Wed, 4 Nov 2026 20:46:12 -0500
+Subject: [PATCH] feat(octo): Octo client (acquisitions, find songs) and an
+ Octo requests card on Home
+
+Wire shapes follow winters27/octo-player (GPL-3.0). The card shows only when the server lists octoAcquisitions.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../local/presentation/screens/HomeScreen.kt  |   2 +
+ .../rhythm/app/features/octo/OctoClient.kt    |  44 +++++
+ .../rhythm/app/features/octo/OctoModels.kt    | 152 ++++++++++++++++++
+ .../app/features/octo/OctoRequestsCard.kt     | 108 +++++++++++++
+ .../data/provider/SubsonicApiClient.kt        |   7 +
+ .../app/features/octo/OctoParsersTest.kt      |  72 +++++++++
+ 6 files changed, 385 insertions(+)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoModels.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoRequestsCard.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/OctoParsersTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+index 46f62b5a..e6c01a83 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+@@ -988,6 +988,8 @@ private fun StreamingHomeBody(
+ 
+         // Fork: Downloads shortcut card (offline/DownloadsEntryUi.kt; shows by DownloadsCardRule)
+         chromahub.rhythm.app.offline.OfflineDownloadsCard(streamingConfigured = hasConfiguredSession || hasOfflineContent)
++        // Fork (Octo): what the Octo server is fetching for the user (features/octo); draws nothing elsewhere
++        if (hasConfiguredSession) chromahub.rhythm.app.features.octo.OctoRequestsCard(modifier = Modifier.padding(top = 12.dp))
+ 
+         val isTablet = widthSizeClass != WindowWidthSizeClass.Compact || windowScreenWidthDp() >= 600
+         val isLandscapeTablet = isTablet && windowScreenWidthDp() > windowScreenHeightDp()
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
+new file mode 100644
+index 00000000..1f396748
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import android.content.Context
++import chromahub.rhythm.app.features.streaming.data.provider.SubsonicApiClient
++
++/**
++ * Fork (Octo): the calls only an Octo server answers. [supports] says whether the server it is pointed at is one;
++ * every other call fails cleanly against a plain Navidrome.
++ */
++class OctoClient(private val api: SubsonicApiClient) {
++    constructor(context: Context) : this(SubsonicApiClient(context.applicationContext))
++
++    suspend fun extensions(): Result<Map<String, Set<Int>>> =
++        api.call("getOpenSubsonicExtensions").map { OctoParsers.extensions(it.optJSONArray("openSubsonicExtensions")) }
++
++    suspend fun supports(name: String, version: Int = 1): Boolean =
++        extensions().getOrNull()?.get(name)?.let { version in it } ?: false
++
++    suspend fun acquisitions(): Result<List<Acquisition>> =
++        api.call("getAcquisitions").map { OctoParsers.acquisitions(it.optJSONObject("acquisitions")) }
++
++    suspend fun acquisition(key: String): Result<Acquisition> =
++        api.call("getAcquisition", mapOf("key" to key)).map { OctoParsers.acquisition(it.getJSONObject("acquisition")) }
++
++    suspend fun clearAcquisitions(key: String? = null): Result<Int> =
++        api.call("clearAcquisitions", key?.let { mapOf("key" to it) }.orEmpty())
++            .map { it.optJSONObject("cleared")?.optInt("count") ?: 0 }
++
++    /** Starts a Soulseek/Lidarr search for one song; [FoundSongs.done] says when the copies are all in. */
++    suspend fun findSongs(id: String): Result<FoundSongs> =
++        api.call("findSongs", mapOf("id" to id)).map { OctoParsers.foundSongs(it.getJSONObject("foundSongs")) }
++
++    suspend fun foundSongs(search: String): Result<FoundSongs> =
++        api.call("getFoundSongs", mapOf("search" to search)).map { OctoParsers.foundSongs(it.getJSONObject("foundSongs")) }
++
++    suspend fun pick(search: String, copy: FoundCopy): Result<PickResult> {
++        val which = copy.id?.let { "copy" to it } ?: copy.index?.let { "candidate" to it.toString() }
++            ?: return Result.failure(IllegalArgumentException("This copy cannot be picked. Search again."))
++        return api.call("pickFoundSong", mapOf("search" to search, which.first to which.second))
++            .map { OctoParsers.pick(it.getJSONObject("pick")) }
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoModels.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoModels.kt
+new file mode 100644
+index 00000000..5cd369c6
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoModels.kt
+@@ -0,0 +1,152 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/*
++ * Fork (Octo): the extra Subsonic calls an Octo server answers, as winters27/octo-player (GPL-3.0) uses them.
++ * The wire shapes follow that project's client and fixtures; only what Rhythm shows is read.
++ */
++
++const val OCTO_ACQUISITIONS = "octoAcquisitions"
++const val OCTO_IMPORTS = "octoImports"
++const val OCTO_STATIONS = "octoStations"
++
++enum class AcquisitionStage(val wire: String) {
++    Queued("queued"), Searching("searching"), Downloading("downloading"), Verifying("verifying"),
++    Importing("importing"), Done("done"), Failed("failed"), Unknown("");
++
++    val finished: Boolean get() = this == Done || this == Failed
++
++    companion object {
++        fun of(text: String?): AcquisitionStage {
++            val wire = text?.trim()?.lowercase().orEmpty()
++            return entries.firstOrNull { it != Unknown && it.wire == wire } ?: Unknown
++        }
++    }
++}
++
++data class AcquisitionEvent(val at: String, val text: String)
++
++/** One song Octo is downloading for the signed-in user, or finished lately. */
++data class Acquisition(
++    val id: String,
++    val artist: String,
++    val title: String,
++    val album: String?,
++    val state: String,
++    val progress: Float?,
++    val source: String?,
++    val error: String?,
++    val libraryId: String?,
++    val key: String?,
++    val quality: String?,
++    val peer: String?,
++    val note: String?,
++    val ahead: Int?,
++    val log: List<AcquisitionEvent>,
++) {
++    val stage: AcquisitionStage get() = AcquisitionStage.of(state)
++    val fraction: Float? get() = progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
++}
++
++data class FoundCopy(
++    val id: String?,
++    val index: Int?,
++    val source: String,
++    val peer: String?,
++    val file: String,
++    val format: String?,
++    val quality: String?,
++    val size: Long,
++    val note: String?,
++)
++
++data class FoundSongs(
++    val id: String,
++    val state: String,
++    val error: String?,
++    val title: String,
++    val artist: String,
++    val libraryId: String?,
++    val copies: List<FoundCopy>,
++) {
++    val done: Boolean get() = state.equals("done", true) || state.equals("failed", true)
++}
++
++data class PickResult(val state: String, val detail: String?, val key: String?)
++
++object OctoParsers {
++    private fun JSONObject.str(name: String): String? =
++        if (isNull(name)) null else optString(name).takeIf { it.isNotBlank() }
++
++    private fun JSONObject.floatOrNull(name: String): Float? =
++        if (has(name) && !isNull(name)) optDouble(name).toFloat().takeIf { it.isFinite() } else null
++
++    /** The `acquisitions` container: `acquisition` is an array, or one object when there is a single row. */
++    fun acquisitions(container: JSONObject?): List<Acquisition> = objects(container?.opt("acquisition")).map(::acquisition)
++
++    fun acquisition(o: JSONObject) = Acquisition(
++        id = o.optString("id"),
++        artist = o.optString("artist"),
++        title = o.optString("title"),
++        album = o.str("album"),
++        state = o.optString("state"),
++        progress = o.floatOrNull("progress"),
++        source = o.str("source"),
++        error = o.str("error"),
++        libraryId = o.str("libraryId"),
++        key = o.str("key"),
++        quality = o.str("quality"),
++        peer = o.str("peer"),
++        note = o.str("note"),
++        ahead = if (o.has("ahead") && !o.isNull("ahead")) o.optInt("ahead") else null,
++        log = objects(o.opt("event")).map { AcquisitionEvent(it.optString("at", it.optString("time")), it.optString("text", it.optString("message"))) },
++    )
++
++    fun foundSongs(o: JSONObject): FoundSongs {
++        val song = o.optJSONObject("song")
++        return FoundSongs(
++            id = o.optString("id"),
++            state = o.optString("state"),
++            error = o.str("error"),
++            title = song?.optString("title").orEmpty(),
++            artist = song?.optString("artist").orEmpty(),
++            libraryId = song?.str("libraryId"),
++            copies = objects(o.opt("candidate")).map {
++                FoundCopy(
++                    id = it.str("id"),
++                    index = if (it.has("index") && !it.isNull("index")) it.optInt("index") else null,
++                    source = it.optString("source"),
++                    peer = it.str("peer"),
++                    file = it.optString("file"),
++                    format = it.str("format"),
++                    quality = it.str("quality"),
++                    size = it.optLong("size"),
++                    note = it.str("note"),
++                )
++            },
++        )
++    }
++
++    fun pick(o: JSONObject) = PickResult(o.optString("state"), o.str("detail"), o.str("key"))
++
++    /** Extension name -> versions, from `openSubsonicExtensions`. */
++    fun extensions(array: JSONArray?): Map<String, Set<Int>> {
++        val out = HashMap<String, Set<Int>>()
++        for (i in 0 until (array?.length() ?: 0)) {
++            val e = array!!.optJSONObject(i) ?: continue
++            val versions = e.optJSONArray("versions")
++            out[e.optString("name")] = (0 until (versions?.length() ?: 0)).map { versions!!.optInt(it) }.toSet()
++        }
++        return out
++    }
++
++    private fun objects(value: Any?): List<JSONObject> = when (value) {
++        is JSONArray -> (0 until value.length()).mapNotNull { value.optJSONObject(it) }
++        is JSONObject -> listOf(value)
++        else -> emptyList()
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoRequestsCard.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoRequestsCard.kt
+new file mode 100644
+index 00000000..c0034d74
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoRequestsCard.kt
+@@ -0,0 +1,108 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import chromahub.rhythm.app.core.utils.NetworkUtils
++import chromahub.rhythm.app.shared.data.model.AppSettings
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++
++/** One line of words for an acquisition: where it is, never a raw state. */
++fun acquisitionStatus(a: Acquisition): String = when (a.stage) {
++    AcquisitionStage.Queued -> a.ahead?.takeIf { it > 0 }?.let { "Waiting · $it ahead" } ?: "Waiting"
++    AcquisitionStage.Searching -> "Looking for a copy" + (a.note?.let { " · $it" } ?: "")
++    AcquisitionStage.Downloading -> "Downloading" + (a.fraction?.let { " ${(it * 100).toInt()}%" } ?: "") + (a.source?.let { " · $it" } ?: "")
++    AcquisitionStage.Verifying -> "Checking the file"
++    AcquisitionStage.Importing -> "Adding to your library"
++    AcquisitionStage.Done -> "In your library" + (a.quality?.let { " · $it" } ?: "")
++    AcquisitionStage.Failed -> "Failed" + (a.error?.let { ": $it" } ?: "")
++    AcquisitionStage.Unknown -> a.state.ifBlank { "Working" }
++}
++
++/**
++ * Fork (Octo): what the Octo server is fetching for the user (songs hearted or added while previewing), as the Octo
++ * apps' downloads drawer shows it. Draws nothing on a plain Navidrome, offline, or when nothing was asked for.
++ */
++@Composable
++fun OctoRequestsCard(modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    val offlineMode by AppSettings.getInstance(context).offlineMode.collectAsState()
++    var rows by remember { mutableStateOf<List<Acquisition>>(emptyList()) }
++    val scope = rememberCoroutineScope()
++    val client = remember { OctoClient(context) }
++
++    LaunchedEffect(offlineMode) {
++        if (offlineMode || !NetworkUtils.isNetworkAvailable(context)) { rows = emptyList(); return@LaunchedEffect }
++        val exts = client.extensions()
++        if (exts.getOrNull()?.get(OCTO_ACQUISITIONS) == null) return@LaunchedEffect
++        while (true) {
++            client.acquisitions().onSuccess { rows = it }
++            // Quick while something is moving, lazy once everything has settled.
++            delay(if (rows.any { !it.stage.finished }) 5_000L else 30_000L)
++        }
++    }
++    if (rows.isEmpty()) return
++
++    val working = rows.count { !it.stage.finished }
++    Card(
++        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
++        shape = RoundedCornerShape(20.dp),
++        modifier = modifier.fillMaxWidth(),
++    ) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
++                Text(
++                    if (working > 0) "Octo is getting $working ${if (working == 1) "song" else "songs"}" else "Octo's recent requests",
++                    style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold,
++                )
++                if (rows.any { it.stage.finished }) {
++                    TextButton(onClick = {
++                        scope.launch { client.clearAcquisitions().onSuccess { client.acquisitions().onSuccess { rows = it } } }
++                    }) { Text("Clear finished") }
++                }
++            }
++            rows.take(8).forEach { a ->
++                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                    Text("${a.artist} – ${a.title}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                    Text(
++                        acquisitionStatus(a),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = if (a.stage == AcquisitionStage.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
++                        maxLines = 2, overflow = TextOverflow.Ellipsis,
++                    )
++                    if (a.stage == AcquisitionStage.Downloading) {
++                        a.fraction?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth()) }
++                            ?: LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
++                    }
++                }
++            }
++            if (rows.size > 8) Text("and ${rows.size - 8} more", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 6658f1e7..b677af3d 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -905,6 +905,13 @@ class SubsonicApiClient internal constructor(
+         }
+     }
+ 
++    /** Fork (Octo): any Subsonic/OpenSubsonic call by name, answered as the `subsonic-response` object. */
++    suspend fun call(
++        endpoint: String,
++        params: Map<String, String> = emptyMap(),
++        listParams: Map<String, List<String>> = emptyMap(),
++    ): Result<JSONObject> = if (!isConnected()) Result.failure(IllegalStateException("Subsonic service is not connected")) else requestAndParse(endpoint, params, listParams)
++
+     private suspend fun requestAndParse(
+         endpoint: String, 
+         params: Map<String, String> = emptyMap(),
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoParsersTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoParsersTest.kt
+new file mode 100644
+index 00000000..06baad85
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoParsersTest.kt
+@@ -0,0 +1,72 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class OctoParsersTest {
++    private fun inner(json: String, name: String) = JSONObject(json).getJSONObject("subsonic-response").getJSONObject(name)
++
++    @Test
++    fun anAcquisitionRowIsRead() {
++        val list = OctoParsers.acquisitions(inner(
++            """{"subsonic-response":{"acquisitions":{"acquisition":[{"id":"dz-1","artist":"Daft Punk","title":"HBFS","album":"Discovery","state":"downloading","progress":0.42,"source":"Soulseek","error":null,"libraryId":null}]}}}""",
++            "acquisitions",
++        ))
++        assertEquals(1, list.size)
++        val a = list.single()
++        assertEquals(AcquisitionStage.Downloading, a.stage)
++        assertEquals(0.42f, a.fraction!!, 0.001f)
++        assertNull(a.error)
++        assertEquals("Soulseek", a.source)
++    }
++
++    @Test
++    fun aSingleRowComesAsOneObject() {
++        val list = OctoParsers.acquisitions(inner(
++            """{"subsonic-response":{"acquisitions":{"acquisition":{"id":"x","artist":"A","title":"T","state":"failed","error":"no peers"}}}}""",
++            "acquisitions",
++        ))
++        assertEquals(AcquisitionStage.Failed, list.single().stage)
++        assertTrue(list.single().stage.finished)
++        assertEquals("no peers", list.single().error)
++    }
++
++    @Test
++    fun anUnknownStageIsUnknownNotAnError() {
++        assertEquals(AcquisitionStage.Unknown, AcquisitionStage.of("transmogrifying"))
++    }
++
++    @Test
++    fun foundSongsListsEveryCopyWithItsIdOrIndex() {
++        val f = OctoParsers.foundSongs(inner(
++            """{"subsonic-response":{"foundSongs":{"id":"s1","state":"done","song":{"artist":"Air","title":"Sexy Boy","libraryId":"nd-7"},"candidate":[{"source":"Soulseek","peer":"p1","file":"a.flac","format":"flac","quality":"FLAC 16","size":31000000,"index":0,"id":"c-1"},{"source":"Soulseek","file":"b.mp3","size":9,"note":"Another version","index":1}]}}}""",
++            "foundSongs",
++        ))
++        assertTrue(f.done)
++        assertEquals("nd-7", f.libraryId)
++        assertEquals("c-1", f.copies[0].id)
++        assertNull(f.copies[1].id)
++        assertEquals(1, f.copies[1].index)
++        assertEquals("Another version", f.copies[1].note)
++    }
++
++    @Test
++    fun extensionsMapNamesToVersions() {
++        val e = OctoParsers.extensions(JSONObject("""{"x":[{"name":"octoAcquisitions","versions":[1,2]},{"name":"songLyrics","versions":[1]}]}""").getJSONArray("x"))
++        assertTrue(2 in e.getValue(OCTO_ACQUISITIONS))
++        assertFalse(e.containsKey(OCTO_IMPORTS))
++    }
++
++    @Test
++    fun aPickAnswersItsStateAndKey() {
++        val p = OctoParsers.pick(inner("""{"subsonic-response":{"pick":{"state":"queued","detail":"Getting FLAC","key":"soulseek:3kX9Qm"}}}""", "pick"))
++        assertEquals("queued", p.state)
++        assertEquals("soulseek:3kX9Qm", p.key)
++    }
++}
+-- 
+2.56.0
+
