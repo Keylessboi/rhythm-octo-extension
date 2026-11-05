@@ -1,0 +1,62 @@
+From d8e8e0bf235eb8f65cbfeb80e45668f52a1a6b95 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Thu, 5 Nov 2026 07:11:28 -0500
+Subject: [PATCH] feat(octo): rotate Octo-made charts and mixes like its radios
+ (Liked Songs stays the user's)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../streaming/data/provider/SubsonicApiClient.kt     | 12 ++++++++++--
+ .../data/provider/SubsonicOctoRadioPlaylistTest.kt   |  8 ++++++++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 3dfb01c2..8b930aac 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -1330,7 +1330,7 @@ class SubsonicApiClient internal constructor(
+                         songCount = playlist.optInt("songCount", 0),
+                         owner = playlist.optString("owner").takeIf { it.isNotBlank() },
+                         isPublic = playlist.optBoolean("public", true),
+-                        isOctoRadio = OctoRadioCover.matches(coverArtId)
++                        isOctoRadio = OctoRadioCover.matches(coverArtId, playlist.optString("comment"))
+                     )
+                 )
+             }
+@@ -1500,5 +1500,13 @@ internal object OctoRadioCover {
+     // Octo 2026.10 hands its radios a generated cover id: "or" plus 22 base62 characters.
+     private val generated = Regex("^or[A-Za-z0-9]{20,22}$")
+ 
+-    fun matches(coverArtId: String?): Boolean = coverArtId != null && (coverArtId == LEGACY_ID || generated.matches(coverArtId))
++    // Its charts and mixes ("Popular right now", "Deep Cuts") carry "og…_2cNN" covers and say so in their comment.
++    // The same kind of cover is on "Liked Songs", which is the user's own, so the comment decides.
++    private val chart = Regex("^og[A-Za-z0-9]{20,22}(_2c\\d+)?$")
++
++    fun matches(coverArtId: String?, comment: String? = null): Boolean = when {
++        coverArtId == null -> false
++        coverArtId == LEGACY_ID || generated.matches(coverArtId) -> true
++        else -> chart.matches(coverArtId) && comment?.contains("by Octo", ignoreCase = true) == true
++    }
+ }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+index 20c4dfd9..5d1d930b 100644
+--- a/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicOctoRadioPlaylistTest.kt
+@@ -122,6 +122,14 @@ class SubsonicOctoRadioPlaylistTest {
+         assertTrue(OctoRadioCover.matches("octo-radio"))
+         assertFalse(OctoRadioCover.matches("pl-4AoYlyR0y10cKBMvbheChj_fc5b5d40650d0150"))
+         assertFalse(OctoRadioCover.matches("ogXY8Zlh9lMAuQRFyQGhcq_2c99"))
++    }
++
++    @Test
++    fun octoMadeChartsAndMixesRotateButLikedSongsDoesNot() {
++        assertTrue(OctoRadioCover.matches("ogXY8Zlh9lMAuQRFyQGhcq_2c99", "The best new songs of the week, made by Octo. Songs you have play from your library."))
++        assertTrue(OctoRadioCover.matches("ogByc1Qyd6lq7syvqsmXEO_2c50", "Made for you by Octo from your plays"))
++        assertFalse(OctoRadioCover.matches("ogk1Ujj6kaQS5MaAtWpBuy_2c100", "Your hearted songs, newest first"))
++        assertFalse(OctoRadioCover.matches("ogXY8Zlh9lMAuQRFyQGhcq_2c99", null))
+         assertFalse(OctoRadioCover.matches(null))
+     }
+ }
+-- 
+2.56.0
+
