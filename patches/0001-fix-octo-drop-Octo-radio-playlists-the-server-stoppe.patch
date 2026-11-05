@@ -1,0 +1,111 @@
+From 5d643b41ac4acc000d27ecaccd3888df03a02b50 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Wed, 4 Nov 2026 20:52:09 -0500
+Subject: [PATCH] fix(octo): drop Octo radio playlists the server stopped
+ listing so their songs are released
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../rhythm/app/offline/PinSettings.kt         | 11 ++++++++
+ .../chromahub/rhythm/app/offline/PinSync.kt   | 25 ++++++++++++++++---
+ .../app/offline/PinSyncOctoRadioTest.kt       | 14 +++++++++++
+ 3 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
+index 6611af46..ddd6127b 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSettings.kt
+@@ -34,6 +34,16 @@ class PinSettings private constructor(private val prefs: SharedPreferences) {
+         _keepOctoRadio.value = on
+     }
+ 
++    /** Names the server has shown as Octo radio playlists: they are managed by the sync, not by the user's switches. */
++    @Synchronized
++    fun octoRadioNames(): Set<String> = prefs.getStringSet(KEY_OCTO_NAMES, emptySet()).orEmpty().toSet()
++
++    @Synchronized
++    fun rememberOctoRadio(names: List<String>) {
++        val next = octoRadioNames() + names
++        if (next != octoRadioNames()) prefs.edit().putStringSet(KEY_OCTO_NAMES, next).apply()
++    }
++
+     @Synchronized
+     fun setKeepFavorites(on: Boolean) {
+         prefs.edit().putBoolean(KEY_FAVORITES, on).apply()
+@@ -91,6 +101,7 @@ class PinSettings private constructor(private val prefs: SharedPreferences) {
+         private const val KEY_FAVORITES = "pin_favorites"
+         private const val KEY_PLAYLISTS_KEPT = "pin_playlists_kept_names"
+         private const val KEY_OCTO_RADIO = "pin_octo_radio"
++        private const val KEY_OCTO_NAMES = "pin_octo_radio_names"
+         private const val KEY_LEGACY_ON = "pin_playlists_on"
+         private const val KEY_LEGACY_OFF = "pin_playlists_off"
+         private const val KEY_LAST_SYNC = "pin_last_sync_ms"
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+index e30c0a26..228101c0 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+@@ -91,8 +91,26 @@ object PinSync {
+         Observed(sources, songs, frozen = emptySet(), absent = emptySet(), listingRead = true)
+ 
+     /** The playlist names a sync keeps: the user's choices, plus Octo's radio playlists while [keepOctoRadio] is on. */
+-    fun keptNames(chosen: Set<String>, listing: List<PinPlaylist>?, keepOctoRadio: Boolean): Set<String> =
+-        if (!keepOctoRadio || listing == null) chosen else chosen + listing.filter { it.octoRadio }.map { it.name }
++    fun keptNames(chosen: Set<String>, listing: List<PinPlaylist>?, keepOctoRadio: Boolean, knownOcto: Set<String> = emptySet()): Set<String> {
++        if (listing == null) return chosen
++        if (!keepOctoRadio) return chosen
++        // An Octo radio playlist is kept because it is current, never because someone switched it on once: one the
++        // server stopped listing is old, and dropping its name releases its songs (Octo rotates them every day).
++        val listed = listing.associateBy { it.name }
++        // A name that looks like Octo's but is an ordinary playlist the server lists stays the user's.
++        val manual = chosen.filterTo(LinkedHashSet()) { name ->
++            val p = listed[name]
++            when {
++                p != null -> !p.octoRadio
++                else -> name !in knownOcto && !looksLikeOctoRadio(name)
++            }
++        }
++        return manual + listing.filter { it.octoRadio }.map { it.name }
++    }
++
++    /** Names Octo gives its generated stations, for playlists kept before the app could tell them by their cover. */
++    fun looksLikeOctoRadio(name: String): Boolean =
++        name == "Your Mix" || name == "Discovery Mix" || name == "Starter Radio" || name.endsWith(" Radio")
+ 
+     /** What [derive] worked out: the plan (also the [PinRunInterval.Run] it is judged by) and the ledger's entries for it. */
+     data class Derived(
+@@ -125,7 +143,8 @@ object PinSync {
+         val listing = repo.fetchPlaylistsForPins()
+         // A phone that ran the build that kept playlists by id: those switches become names (needs a good listing).
+         listing.getOrNull()?.takeIf { it.isNotEmpty() }?.let { list -> settings.migrateLegacyIds(list.associate { it.id to it.name }) }
+-        val wanted = keptNames(settings.keptPlaylists.value, listing.getOrNull(), settings.keepOctoRadio.value)
++        listing.getOrNull()?.let { settings.rememberOctoRadio(it.filter { p -> p.octoRadio }.map { p -> p.name }) }
++        val wanted = keptNames(settings.keptPlaylists.value, listing.getOrNull(), settings.keepOctoRadio.value, settings.octoRadioNames())
+         val selection = PlaylistSelector.select(listing, wanted, heldPlaylists)
+         // Frozen (listing not believed) and absent (deleted on the server): their pins stay exactly as they are.
+         (selection.frozen + selection.absent).forEach { sources[it] = SourceState.Unavailable }
+diff --git a/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt b/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
+index abdee106..2bbb577f 100644
+--- a/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/offline/PinSyncOctoRadioTest.kt
+@@ -27,4 +27,18 @@ class PinSyncOctoRadioTest {
+     fun anUnreadListingKeepsTheChoicesAsTheyWere() {
+         assertEquals(setOf("Gym"), PinSync.keptNames(setOf("Gym"), null, true))
+     }
++
++    @Test
++    fun anOctoPlaylistTheServerNoLongerListsIsDroppedSoItsSongsAreReleased() {
++        // "OutKast Radio" was kept once; Octo rotated it away. It is not in the listing now, so it is not wanted.
++        val kept = setOf("Gym", "OutKast Radio", "Your Mix")
++        val wanted = PinSync.keptNames(kept, listing, true, knownOcto = setOf("Your Mix"))
++        assertEquals(setOf("Gym", "Your Mix", "Starter Radio"), wanted)
++    }
++
++    @Test
++    fun anOrdinaryPlaylistNamedLikeARadioIsStillCaughtByItsName() {
++        assertEquals(true, PinSync.looksLikeOctoRadio("Trap Radio"))
++        assertEquals(false, PinSync.looksLikeOctoRadio("Gym"))
++    }
+ }
+-- 
+2.56.0
+
