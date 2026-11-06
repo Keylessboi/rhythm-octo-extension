@@ -1,0 +1,235 @@
+From e13e7984c5c27d77173fa11567180e293bd05b26 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Fri, 6 Nov 2026 06:24:59 -0500
+Subject: [PATCH] feat(offline): plays made offline are scrobbled later with
+ their real time
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../data/provider/SubsonicApiClient.kt        |  4 +-
+ .../StreamingMusicRepositoryImpl.kt           | 11 +++
+ .../chromahub/rhythm/app/offline/PinSync.kt   |  1 +
+ .../rhythm/app/offline/ScrobbleQueue.kt       | 81 +++++++++++++++++++
+ .../rhythm/app/offline/ScrobbleQueueTest.kt   | 65 +++++++++++++++
+ 5 files changed, 160 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/offline/ScrobbleQueue.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/offline/ScrobbleQueueTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+index 8b930aac..92b9a473 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/provider/SubsonicApiClient.kt
+@@ -545,13 +545,13 @@ class SubsonicApiClient internal constructor(
+         return requestAndParse(endpoint, mapOf("id" to id)).map { true }
+     }
+ 
+-    suspend fun scrobble(id: String, submission: Boolean): Result<Boolean> {
++    suspend fun scrobble(id: String, submission: Boolean, playedAtMs: Long = System.currentTimeMillis()): Result<Boolean> {
+         if (!isConnected()) return Result.failure(IllegalStateException("Subsonic service is not connected"))
+         if (id.isBlank()) return Result.failure(IllegalArgumentException("Id is required"))
+ 
+         return requestAndParse(
+             "scrobble", 
+-            mapOf("id" to id, "submission" to submission.toString(), "time" to System.currentTimeMillis().toString())
++            mapOf("id" to id, "submission" to submission.toString(), "time" to playedAtMs.toString())
+         ).map { true }
+     }
+ 
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+index c87d4b44..9f36fdfd 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/data/repository/StreamingMusicRepositoryImpl.kt
+@@ -1096,9 +1096,20 @@ class StreamingMusicRepositoryImpl(
+         }
+     }
+ 
++    private val scrobbles by lazy {
++        chromahub.rhythm.app.offline.Scrobbles(context) { id, at ->
++            isServiceConnected(StreamingServiceId.SUBSONIC) && subsonicClient.scrobble(id, true, at).isSuccess
++        }
++    }
++
++    /** Sends the plays queued while offline; the sync worker calls this when the server is reachable. */
++    suspend fun flushScrobbles() = scrobbles.flush()
++
+     override suspend fun reportPlaybackStop(songId: String, positionMs: Long): Boolean {
+         val decoded = decodeSongId(songId) ?: return false
+         val (serviceId, providerId) = decoded
++        // Fork (offline): a play the server cannot be told about now is kept and sent later with the time it was played.
++        if (serviceId == StreamingServiceId.SUBSONIC) return scrobbles.report(providerId, System.currentTimeMillis())
+         if (!isServiceConnected(serviceId)) return false
+         
+         return when (serviceId) {
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+index 228101c0..277aa10e 100644
+--- a/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
++++ b/app/src/main/java/chromahub/rhythm/app/offline/PinSync.kt
+@@ -259,6 +259,7 @@ class PinSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorke
+             val observed = PinSync.observe(applicationContext, repo)
+             val summary = PinSync.commit(applicationContext, repo, observed)
+             OctoGrabs.resolve(applicationContext, repo) // heart the songs Octo has landed since the last run
++            (repo as? chromahub.rhythm.app.features.streaming.data.repository.StreamingMusicRepositoryImpl)?.flushScrobbles()
+             if (!summary.complete && summary.skipped == null && runAttemptCount < MAX_RETRIES) Result.retry() else Result.success()
+         } catch (e: CancellationException) {
+             throw e
+diff --git a/app/src/main/java/chromahub/rhythm/app/offline/ScrobbleQueue.kt b/app/src/main/java/chromahub/rhythm/app/offline/ScrobbleQueue.kt
+new file mode 100644
+index 00000000..2bcd688e
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/offline/ScrobbleQueue.kt
+@@ -0,0 +1,81 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.offline
++
++import com.google.gson.Gson
++import com.google.gson.reflect.TypeToken
++import java.io.File
++
++/** A play that finished while the server could not be reached; it keeps the time it was really played. */
++data class PendingScrobble(val songId: String, val playedAtMs: Long)
++
++/**
++ * Fork: plays made offline (a subway ride) are sent to the server later with their own timestamps, so the server's play
++ * counts, "recently played" and Octo's recommendations see them. Kept in a small file next to the other offline state.
++ */
++class ScrobbleQueue(private val file: File) {
++    private val gson = Gson()
++    private val type = object : TypeToken<List<PendingScrobble>>() {}.type
++
++    @Synchronized
++    fun all(): List<PendingScrobble> = runCatching {
++        if (!file.exists()) emptyList() else gson.fromJson<List<PendingScrobble>>(file.readText(), type).orEmpty()
++    }.getOrDefault(emptyList())
++
++    @Synchronized
++    fun add(songId: String, playedAtMs: Long) {
++        val queued = all()
++        // The player reports one stop twice a moment apart; that is one play.
++        if (queued.any { it.songId == songId && kotlin.math.abs(it.playedAtMs - playedAtMs) < DUPLICATE_WINDOW_MS }) return
++        write((queued + PendingScrobble(songId, playedAtMs)).takeLast(MAX))
++    }
++
++    /** Sends each play through [submit], oldest first; what it reports as sent is dropped, the rest stays queued. */
++    suspend fun flush(stopOnFailure: Boolean = false, submit: suspend (songId: String, playedAtMs: Long) -> Boolean) {
++        for (play in all()) {
++            if (submit(play.songId, play.playedAtMs)) remove(play) else if (stopOnFailure) return
++        }
++    }
++
++    @Synchronized
++    private fun remove(play: PendingScrobble) {
++        val rest = all().toMutableList()
++        if (rest.remove(play)) write(rest)
++    }
++
++    private fun write(list: List<PendingScrobble>) {
++        val tmp = File(file.parentFile, file.name + ".tmp")
++        tmp.writeText(gson.toJson(list))
++        if (!tmp.renameTo(file)) { file.writeText(gson.toJson(list)); tmp.delete() }
++    }
++
++    companion object {
++        const val MAX = 2000
++        private const val DUPLICATE_WINDOW_MS = 5_000L
++    }
++}
++
++/** Reports plays through [submit]; a play that cannot be sent goes in the queue, and a good connection drains it. */
++class Scrobbles(context: android.content.Context, private val submit: suspend (songId: String, playedAtMs: Long) -> Boolean) {
++    private val queue = ScrobbleQueue(File(context.applicationContext.filesDir, "scrobble_queue.json"))
++
++    suspend fun report(songId: String, playedAtMs: Long): Boolean {
++        val sent = runCatching { submit(songId, playedAtMs) }.onFailure { android.util.Log.w(TAG, "scrobble failed", it) }.getOrDefault(false)
++        android.util.Log.i(TAG, "scrobble $songId sent=$sent queued=${queue.all().size}")
++        if (sent) {
++            flush()
++            return true
++        }
++        queue.add(songId, playedAtMs)
++        return false
++    }
++
++    suspend fun flush() = queue.flush(stopOnFailure = true) { id, at ->
++        runCatching { submit(id, at) }.onFailure { android.util.Log.w(TAG, "flush failed", it) }.getOrDefault(false)
++            .also { android.util.Log.i(TAG, "flush $id sent=$it") }
++    }
++
++    private companion object {
++        const val TAG = "Scrobbles"
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/offline/ScrobbleQueueTest.kt b/app/src/test/java/chromahub/rhythm/app/offline/ScrobbleQueueTest.kt
+new file mode 100644
+index 00000000..39416730
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/offline/ScrobbleQueueTest.kt
+@@ -0,0 +1,65 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.offline
++
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class ScrobbleQueueTest {
++    @get:Rule val tmp = TemporaryFolder()
++
++    private fun queue() = ScrobbleQueue(java.io.File(tmp.root, "scrobbles.json"))
++
++    @Test
++    fun aPlayMadeOfflineIsKeptWithItsOwnTime() {
++        val q = queue()
++        q.add("song1", 1_000L)
++        q.add("song2", 2_000L)
++        assertEquals(listOf("song1" to 1_000L, "song2" to 2_000L), q.all().map { it.songId to it.playedAtMs })
++    }
++
++    @Test
++    fun theQueueSurvivesARestart() {
++        queue().add("song1", 1_000L)
++        assertEquals(1, queue().all().size)
++    }
++
++    @Test
++    fun flushSendsInOrderAndKeepsWhatFailed() = runBlocking {
++        val q = queue()
++        q.add("a", 1L); q.add("b", 2L); q.add("c", 3L)
++        val sent = mutableListOf<String>()
++        q.flush { id, _ -> if (id == "b") false else { sent += id; true } }
++        assertEquals(listOf("a", "c"), sent)
++        assertEquals(listOf("b"), q.all().map { it.songId })
++    }
++
++    @Test
++    fun flushStopsAtTheFirstFailureSoAnOfflinePhoneDoesNotHammerTheServer() = runBlocking {
++        val q = queue()
++        q.add("a", 1L); q.add("b", 2L)
++        var calls = 0
++        q.flush(stopOnFailure = true) { _, _ -> calls++; false }
++        assertEquals(1, calls)
++        assertEquals(2, q.all().size)
++    }
++
++    @Test
++    fun theQueueIsCappedAtTheNewestPlays() {
++        val q = queue()
++        repeat(ScrobbleQueue.MAX + 5) { q.add("s$it", it.toLong()) }
++        assertEquals(ScrobbleQueue.MAX, q.all().size)
++        assertTrue(q.all().none { it.songId == "s0" })
++    }
++
++    @Test
++    fun theSameStopReportedTwiceIsOnePlay() {
++        val q = queue()
++        q.add("a", 1_000L); q.add("a", 1_140L); q.add("a", 60_000L)
++        assertEquals(listOf(1_000L, 60_000L), q.all().map { it.playedAtMs })
++    }
++}
+-- 
+2.56.0
+
