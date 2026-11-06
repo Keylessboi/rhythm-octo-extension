@@ -5,6 +5,11 @@ package chromahub.rhythm.app.features.octo
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyRow
@@ -41,7 +46,12 @@ fun OctoStationsRow(viewModel: StreamingMusicViewModel, modifier: Modifier = Mod
     val stations = remember(playlists) { OctoStations.of(playlists) }
     if (stations.isEmpty()) return
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Octo stations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        var tuning by remember { mutableStateOf(false) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Octo stations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            TextButton(onClick = { tuning = true }) { Text("Tune radio") }
+        }
+        if (tuning) chromahub.rhythm.app.features.octo.radio.RadioTuningDialog { tuning = false }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             items(stations, key = { it.id }) { station ->
                 Card(

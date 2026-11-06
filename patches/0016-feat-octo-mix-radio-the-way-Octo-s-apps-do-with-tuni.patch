@@ -1,0 +1,1223 @@
+From 156e855eb0ade7614789852ed938dba142546861 Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Fri, 6 Nov 2026 06:51:58 -0500
+Subject: [PATCH] feat(octo): mix radio the way Octo's apps do, with tuning
+ (library share, adventure, variety, favorites)
+
+Ported from winters27/octo-player (GPL-3.0); its own mixer tests pass unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../rhythm/app/features/octo/OctoStations.kt  |  12 +-
+ .../app/features/octo/radio/RadioFilter.kt    |  28 ++
+ .../app/features/octo/radio/RadioMix.kt       | 385 ++++++++++++++++++
+ .../app/features/octo/radio/RadioSettings.kt  |  28 ++
+ .../app/features/octo/radio/RadioSong.kt      |  47 +++
+ .../app/features/octo/radio/RadioTuning.kt    |  59 +++
+ .../features/octo/radio/RadioTuningDialog.kt  |  71 ++++
+ .../app/features/octo/radio/StreamingRadio.kt |  49 +++
+ .../viewmodel/StreamingMusicViewModel.kt      |   9 +-
+ .../app/features/octo/radio/RadioMixTest.kt   | 357 ++++++++++++++++
+ .../features/octo/radio/StreamingRadioTest.kt |  60 +++
+ 11 files changed, 1103 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioFilter.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioMix.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSettings.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSong.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuning.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuningDialog.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/radio/StreamingRadio.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/radio/RadioMixTest.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/radio/StreamingRadioTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+index bb9a7c64..ce44a4b1 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoStations.kt
+@@ -5,6 +5,11 @@ package chromahub.rhythm.app.features.octo
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyRow
+@@ -41,7 +46,12 @@ fun OctoStationsRow(viewModel: StreamingMusicViewModel, modifier: Modifier = Mod
+     val stations = remember(playlists) { OctoStations.of(playlists) }
+     if (stations.isEmpty()) return
+     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+-        Text("Octo stations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++        var tuning by remember { mutableStateOf(false) }
++        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
++            Text("Octo stations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++            TextButton(onClick = { tuning = true }) { Text("Tune radio") }
++        }
++        if (tuning) chromahub.rhythm.app.features.octo.radio.RadioTuningDialog { tuning = false }
+         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+             items(stations, key = { it.id }) { station ->
+                 Card(
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioFilter.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioFilter.kt
+new file mode 100644
+index 00000000..0087931c
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioFilter.kt
+@@ -0,0 +1,28 @@
++// SPDX-FileCopyrightText: 2024-2026 winters27 <https://github.com/winters27/octo-player>
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Ported from octo-player (shared/core/.../radio) so Rhythm mixes Octo radio the way Octo's own apps do.
++
++package chromahub.rhythm.app.features.octo.radio
++
++
++
++private const val SHORTEST_MS = 45_000L
++private const val LONGEST_MS = 45 * 60_000L
++private const val SHORT_PIECE_MS = 4 * 60_000L
++
++// Whole words, with the edges spelled out: a plain word boundary means
++// different things on different Java versions and on Android, and the
++// server must agree with both apps.
++private val Talk = Regex("""(?<![\p{L}\p{N}])(interview|podcast)(?![\p{L}\p{N}])""", RegexOption.IGNORE_CASE)
++private val Filler = Regex("""(?<![\p{L}\p{N}])(intro|introduction|skit|interlude)(?![\p{L}\p{N}])""", RegexOption.IGNORE_CASE)
++private val TalkGenres = setOf("podcast", "podcasts", "audiobook", "audiobooks")
++
++// Songs a radio leaves out: shorter than 45 seconds or longer than 45
++// minutes, an interview or a podcast, or an intro, skit or interlude of
++// four minutes or less. A length of 0 is unknown and not held against it.
++fun isRadioFiller(title: String, durationMs: Long, genres: List<String> = emptyList()): Boolean {
++    if (durationMs in 1 until SHORTEST_MS || durationMs > LONGEST_MS) return true
++    if (Talk.containsMatchIn(title)) return true
++    if (genres.any { searchKey(it) in TalkGenres }) return true
++    return durationMs in 1..SHORT_PIECE_MS && Filler.containsMatchIn(title)
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioMix.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioMix.kt
+new file mode 100644
+index 00000000..791dcc9c
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioMix.kt
+@@ -0,0 +1,385 @@
++// SPDX-FileCopyrightText: 2024-2026 winters27 <https://github.com/winters27/octo-player>
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Ported from octo-player (shared/core/.../radio) so Rhythm mixes Octo radio the way Octo's own apps do.
++
++package chromahub.rhythm.app.features.octo.radio
++
++import kotlin.math.PI
++import kotlin.math.cos
++import kotlin.math.ln
++import kotlin.math.max
++import kotlin.math.roundToInt
++import kotlin.math.sqrt
++import kotlin.random.Random
++
++// Octo's radio: songs like the seeds, from the library and from what the
++// server suggests, played the way a good station plays them.
++//
++// Each song is a list of weighted features: its genres (a genre that is
++// rare in this library says more), each genre in the song's era, its year,
++// and who made it. How alike a song is to the seeds is the cosine of the
++// two lists, but only when they share a genre: a shared year or artist
++// lifts a song that already fits and never pulls in one that does not. The
++// server's suggestions add a bonus by their rank. Picks are drawn at random
++// with the better matches favored, then spaced so an album, a title or an
++// artist does not come back too soon. Songs from outside the library land
++// at random, at the share the listener chose (see RadioTuning).
++
++// How much each kind of likeness counts. Genre and genre-in-its-era weigh
++// the same, so a song from the right genre but another era scores well
++// under one from both (about 0.4 against 0.85), which a tenth taken off
++// for not being a favorite cannot overturn.
++private const val GENRE_WEIGHT = 1.0
++private const val ERA_WEIGHT = 1.0
++private const val YEAR_WEIGHT = 0.5
++private const val ARTIST_WEIGHT = 0.6
++private const val COMPOSER_WEIGHT = 0.4
++private const val YEAR_SPREAD = 7
++
++// A server suggestion's bonus: the top one counts about as much as a close
++// match from the library, and the bonus fades down its list.
++private const val SUGGESTED_WEIGHT = 0.5
++private const val RANK_DEPTH = 20.0
++
++// Songs played this recently wait until nothing else will do.
++internal const val RECENT_DAYS = 8
++
++// Nudges: a song not marked as a favorite, one played a lot, and one
++// played in the last couple of weeks each give up a tenth.
++private const val FRESH_DAYS = 15
++private const val MANY_PLAYS = 4
++private const val NUDGE = 0.9
++
++// An artist with a song rated one star gives up half.
++private const val DISLIKED_ARTIST = 0.5
++
++// How far a radio may drift from its share of outside songs, in songs,
++// before the next pick puts it right. Outside songs have a share of their
++// own because library songs carry genre and year and would otherwise win
++// nearly every draw against a suggestion that only has its rank. At 1 song
++// the pull-back fired so often that the old every-third-song opening still
++// came up one radio in fourteen; at 1.5 it is one in two hundred.
++private const val SHARE_SLACK = 1.5
++
++// The most songs of the rarer kind in a row: outside songs when they are
++// under half of the radio, library songs when they are over half.
++private const val RARER_RUN = 2
++
++// What a favorite (a heart, or four or five stars) counts for when the
++// listener asks for favorites more often. A favorite already skips the
++// tenth taken off the rest, so this makes one about 1.3 times as likely.
++private const val FAVORITE_BOOST = 1.15
++
++// A big library is sampled, and only the best matches are drawn from.
++private const val CANDIDATE_CAP = 4000
++private const val KEEP_AT_LEAST = 200
++private const val KEEP_PER_PICK = 8
++
++private const val DAY_MS = 86_400_000L
++
++// What the radio is asked for.
++class RadioInput(
++    // What the radio is like. The first is what it started from.
++    val seeds: List<RadioSong>,
++    // Every song in the library.
++    val library: List<RadioSong>,
++    // The server's songs like the seeds, best first.
++    val suggested: List<RadioSong> = emptyList(),
++    // What played or is queued just before, oldest first; the spacing
++    // carries on from these.
++    val before: List<RadioSong> = emptyList(),
++    // Never picked, like the queue. The first seed is never picked either;
++    // the other seeds can be (an artist radio plays more of the artist).
++    val exclude: Set<String> = emptySet(),
++    val now: Long,
++    // How the listener tuned radio (see RadioTuning).
++    val tuning: RadioTuning = RadioTuning(),
++    // Which of the songs in `before` came from outside the library, oldest
++    // first, so the run of one kind carries on from the songs already
++    // queued. Null works it out from the library; the phone passes it,
++    // since its `before` holds only library songs.
++    val beforeOutside: List<Boolean>? = null,
++)
++
++private class Scored(val song: RadioSong, val score: Double)
++
++// Up to `count` songs like the seeds, in play order. Empty when nothing is
++// alike at all (the seeds have no genre and the server suggested nothing).
++fun radioMix(input: RadioInput, count: Int, random: Random = Random.Default): List<RadioSong> {
++    if (count <= 0 || input.seeds.isEmpty()) return emptyList()
++    val everything = input.library + input.suggested
++    val rarity = genreRarity(everything)
++    val seedFeatures = HashMap<String, Double>()
++    input.seeds.forEach { features(it, rarity, seedFeatures) }
++    val seedNorm = sqrt(seedFeatures.values.sumOf { it * it })
++    val seedGenres = input.seeds.flatMapTo(HashSet()) { it.genreKeys }
++    val seedArtists = input.seeds.flatMapTo(HashSet()) { it.artistKeys }
++    val disliked = everything.filter { it.rating == 1 }.flatMapTo(HashSet()) { it.artistKeys }
++    val rank = HashMap<String, Int>()
++    input.suggested.forEachIndexed { index, song -> rank.putIfAbsent(song.id, index) }
++    val skip = input.exclude + input.seeds.first().id
++    val owned = input.library.mapTo(HashSet()) { it.id }
++
++    // Library songs that could fit: sharing a genre or an artist with the seeds.
++    val fromLibrary = input.library
++        .filter { song -> song.genreKeys.any(seedGenres::contains) || song.artistKeys.any(seedArtists::contains) }
++        .let { if (it.size > CANDIDATE_CAP) it.shuffled(random).take(CANDIDATE_CAP) else it }
++    val scored = (input.suggested + fromLibrary).distinctBy { it.id }
++        .filter { it.id !in skip && it.rating != 1 && !isRadioFiller(it.title, it.durationMs, it.genres) }
++        .map { song ->
++            val own = HashMap<String, Double>()
++            features(song, rarity, own)
++            var score = likeness(own, seedFeatures, seedNorm)
++            rank[song.id]?.let { score += SUGGESTED_WEIGHT / (1 + it / RANK_DEPTH) }
++            Scored(song, nudged(song, score, input.now, disliked, input.tuning.favorites))
++        }
++        .filter { it.score > 0 }
++        .sortedByDescending { it.score }
++    // Songs the library has and songs it does not are drawn from apart, so
++    // the new ones keep their share. Only the library's are trimmed.
++    val (fromOwned, found) = scored.partition { it.song.id in owned }
++    // Only my library: songs from outside it never play, not even to fill.
++    val fromNew = if (input.tuning.discovery == RadioDiscovery.LibraryOnly) emptyList() else found
++    val heardAfter = input.now - RECENT_DAYS * DAY_MS
++    val heardLately = { s: Scored -> (s.song.lastPlayedAt ?: Long.MIN_VALUE) >= heardAfter }
++    // Adventure widens or narrows how many of the best matches stay in,
++    // never below the floor; songs heard lately do not count toward it.
++    val keep = max(KEEP_AT_LEAST, (count * KEEP_PER_PICK * input.tuning.adventure.keep).toInt())
++    val (fresh, lately) = fromOwned.partition { !heardLately(it) }
++    val known = fresh.take(keep)
++    val spare = lately.take(keep)
++    // Variety moves the artist and album spacing; another version of the
++    // same song always waits the usual spacing.
++    val titleGap = radioSpacing(input.library.size)
++    val gap = (titleGap * input.tuning.variety.scale).roundToInt().coerceAtLeast(2)
++    val beforeOutside = input.beforeOutside ?: input.before.map { it.id !in owned }
++    return pick(known, fromNew.filterNot(heardLately), spare + fromNew.filter(heardLately), input.before, count,
++        Spacing(gap, titleGap), input.tuning.discovery.share, input.tuning.adventure.reach, runOf(beforeOutside), random)
++}
++
++// How far apart an album and an artist (`gap`) and a title (`title`) play.
++private class Spacing(val gap: Int, val title: Int)
++
++// The run of one kind at the end of `outside` (oldest first): above 0 for
++// songs from outside the library, below 0 for the library's.
++internal fun runOf(outside: List<Boolean>): Int {
++    val last = outside.lastOrNull() ?: return 0
++    val length = outside.takeLastWhile { it == last }.size
++    return if (last) length else -length
++}
++
++// The share of the picks that can go to songs from outside the library:
++// the share asked for, as far as there are songs of each kind to fill it.
++// Without this, a share the outside songs cannot reach takes them all
++// first and leaves a block of library songs at the end, and the same the
++// other way. The server places outside songs the same way
++// (last_fm_radio_placement.rs, paced_share).
++internal fun pacedShare(share: Double, outside: Int, library: Int, slots: Int): Double {
++    if (slots <= 0 || outside + library == 0) return share
++    if (outside + library < slots) return outside.toDouble() / (outside + library)
++    val most = (outside.toDouble() / slots).coerceIn(0.0, 1.0)
++    val least = (1.0 - library.toDouble() / slots).coerceIn(0.0, 1.0)
++    return share.coerceIn(least, most)
++}
++
++// How many picks apart an album or a title must be; an artist must be half
++// as far. Grows with the library: 8 for a small one, up to 30.
++fun radioSpacing(librarySize: Int): Int = (6.7 + librarySize / 6000.0).toInt().coerceIn(8, 30)
++
++// Whether the next pick goes to a song from outside the library. A draw at
++// the share, so outside songs land anywhere instead of every third song;
++// pulled back once the radio is more than SHARE_SLACK songs off its share;
++// and never more than RARER_RUN of the rarer kind in a row. `run` counts
++// the picks in a row just before: above 0 outside, below 0 library. The
++// server's song radio uses the same rule (last_fm_radio_placement.rs).
++internal fun outsideDue(share: Double, picked: Int, outside: Int, run: Int, random: Random): Boolean {
++    if (share <= 0.0) return false
++    if (share >= 1.0) return true
++    val target = share * (picked + 1)
++    if (target - outside > SHARE_SLACK) return true
++    if (outside + 1 - target > SHARE_SLACK) return false
++    if (share < 0.5 && run >= RARER_RUN) return false
++    if (share > 0.5 && run <= -RARER_RUN) return true
++    return random.nextDouble() < share
++}
++
++// Picks in play order from two sorted lists: `known` (the library's) and
++// `discovered` (suggestions the library does not have), keeping about
++// `share` of the picks for the second while it lasts, placed at random
++// (outsideDue). A draw may land as far down a list as `reach` of its
++// total weight.
++private fun pick(
++    known: List<Scored>,
++    discovered: List<Scored>,
++    spare: List<Scored>,
++    before: List<RadioSong>,
++    count: Int,
++    spacing: Spacing,
++    asked: Double,
++    reach: Double,
++    leadRun: Int,
++    random: Random,
++): List<RadioSong> {
++    val all = known + discovered
++    val albums = all.mapNotNullTo(HashSet()) { it.song.album }.size
++    val artists = all.flatMapTo(HashSet()) { it.song.artistKeys }.size
++    val played = before.toMutableList()
++    val picked = ArrayList<RadioSong>()
++    val taken = HashSet<String>()
++    val held = LinkedHashMap<String, Scored>()
++    val knownTotal = known.sumOf { it.score }
++    val discoveredTotal = discovered.sumOf { it.score }
++    var newPicks = 0
++    var run = leadRun
++    val share = if (asked <= 0.0) 0.0 else pacedShare(asked, discovered.size, known.size, count)
++
++    // One weighted draw from a list: land on the song whose share of the
++    // running total holds a random threshold, then take the first one from
++    // there, going on from the top, that is free and that the spacing
++    // allows. Null when none is.
++    fun draw(list: List<Scored>, total: Double): Scored? {
++        if (list.isEmpty()) return null
++        val threshold = random.nextDouble() * total * reach
++        var start = 0
++        var sum = list[0].score
++        while (start < list.size - 1 && sum < threshold) sum += list[++start].score
++        for (step in list.indices) {
++            val candidate = list[(start + step) % list.size]
++            if (candidate.song.id in taken) continue
++            if (tooSoon(candidate.song, played, spacing, albums, artists, random)) {
++                held.putIfAbsent(candidate.song.id, candidate)
++                continue
++            }
++            return candidate
++        }
++        return null
++    }
++
++    var tries = 0
++    while (picked.size < count && taken.size < all.size && tries++ < count * 100) {
++        val newDue = outsideDue(share, picked.size, newPicks, run, random) && discovered.any { it.song.id !in taken }
++        val chosen = (
++            if (newDue) draw(discovered, discoveredTotal) ?: draw(known, knownTotal)
++            else draw(known, knownTotal) ?: draw(discovered, discoveredTotal)
++            ) ?: continue
++        taken += chosen.song.id
++        picked += chosen.song
++        played += chosen.song
++        if (chosen in discovered) {
++            newPicks++
++            run = maxOf(run, 0) + 1
++        } else {
++            run = minOf(run, 0) - 1
++        }
++    }
++    // Not enough with the spacing: the best of what it held back, then
++    // songs heard lately, never the same artist twice in a row unless
++    // nothing else is left.
++    val rest = (held.values.sortedByDescending { it.score } + spare)
++        .map { it.song }.filter { it.id !in taken }.distinctBy { it.id }.toMutableList()
++    while (picked.size < count && rest.isNotEmpty()) {
++        val last = played.lastOrNull()
++        val next = rest.firstOrNull { song -> last == null || song.artistKeys.none(last.artistKeys::contains) } ?: rest.first()
++        rest.remove(next)
++        taken += next.id
++        picked += next
++        played += next
++    }
++    return picked
++}
++
++// Whether a song would come too soon after the same album, title, artist
++// or composer. The distance is drawn fresh each time so the spacing does
++// not feel mechanical, and never asks for more variety than the pool has.
++private fun tooSoon(song: RadioSong, played: List<RadioSong>, spacing: Spacing, albums: Int, artists: Int, random: Random): Boolean {
++    val gap = spacing.gap
++    val far = minOf(gap + random.nextInt(gap), albums - 1, played.size)
++    if (far > 0) {
++        val recent = played.subList(played.size - far, played.size)
++        if (recent.any { song.album != null && it.album == song.album }) return true
++    }
++    // The title waits the usual spacing whatever the variety; at Normal it
++    // is the album's distance, drawn once.
++    val titleFar = if (spacing.title == gap) far else minOf(spacing.title + random.nextInt(spacing.title), albums - 1, played.size)
++    if (titleFar > 0 && song.titleKey.isNotEmpty()) {
++        val recent = played.subList(played.size - titleFar, played.size)
++        if (recent.any { it.titleKey == song.titleKey }) return true
++    }
++    val half = gap / 2
++    val near = minOf(half + random.nextInt(half + 1), artists - 1, played.size)
++    if (near <= 0) return false
++    val recent = played.subList(played.size - near, played.size)
++    return recent.any { other ->
++        other.artistKeys.any(song.artistKeys::contains) || other.composerKeys.any(song.composerKeys::contains)
++    }
++}
++
++// How telling each genre is in this library: a rarer genre says more.
++// Counted by album, so a long album counts no more than a short one.
++private fun genreRarity(songs: List<RadioSong>): Map<String, Double> {
++    val albums = HashSet<String>()
++    val withGenre = HashMap<String, HashSet<String>>()
++    songs.forEach { song ->
++        val album = song.album ?: song.id
++        albums += album
++        song.genreKeys.forEach { withGenre.getOrPut(it) { HashSet() } += album }
++    }
++    return withGenre.mapValues { (_, set) -> ln(1.0 + albums.size.toDouble() / set.size) }
++}
++
++// A year spread over the seven either side, most on the year itself, so
++// 1994 and 1997 count as close. The spread has a length of one, so a whole
++// year weighs what its weight says however it is spread.
++private val YearShape: DoubleArray = run {
++    val raw = DoubleArray(2 * YEAR_SPREAD + 1) { cos((it - YEAR_SPREAD) / (YEAR_SPREAD + 1.0) * PI / 2) }
++    val length = sqrt(raw.sumOf { it * it })
++    DoubleArray(raw.size) { raw[it] / length }
++}
++
++private fun MutableMap<String, Double>.add(key: String, weight: Double) {
++    this[key] = (this[key] ?: 0.0) + weight
++}
++
++// A song's features, added into `into`. Genre and genre-in-its-era are
++// what a match must share; year, artist and composer only add to one.
++private fun features(song: RadioSong, rarity: Map<String, Double>, into: MutableMap<String, Double>) {
++    val genres = song.genreKeys
++    val total = genres.sumOf { rarity[it] ?: 1.0 }
++    genres.forEach { genre ->
++        val share = (rarity[genre] ?: 1.0) / total
++        into.add("g:$genre", GENRE_WEIGHT * share)
++        song.year?.let { year ->
++            YearShape.forEachIndexed { i, w -> into.add("e:$genre:${year + i - YEAR_SPREAD}", ERA_WEIGHT * share * w) }
++        }
++    }
++    song.year?.let { year ->
++        YearShape.forEachIndexed { i, w -> into.add("y:${year + i - YEAR_SPREAD}", YEAR_WEIGHT * w) }
++    }
++    song.artistKeys.forEach { into.add("a:$it", ARTIST_WEIGHT / song.artistKeys.size) }
++    song.composerKeys.forEach { into.add("c:$it", COMPOSER_WEIGHT / song.composerKeys.size) }
++}
++
++// How alike a song is to the seeds, 0 to 1: the cosine of their features,
++// or 0 when they share no genre.
++private fun likeness(song: Map<String, Double>, seeds: Map<String, Double>, seedNorm: Double): Double {
++    var core = 0.0
++    var extra = 0.0
++    var norm = 0.0
++    for ((key, weight) in song) {
++        norm += weight * weight
++        val other = seeds[key] ?: continue
++        if (key[0] == 'g' || key[0] == 'e') core += weight * other else extra += weight * other
++    }
++    if (core <= 0.0 || norm <= 0.0 || seedNorm <= 0.0) return 0.0
++    return (core + extra) / (sqrt(norm) * seedNorm)
++}
++
++private fun nudged(song: RadioSong, score: Double, now: Long, disliked: Set<String>, favorites: Boolean): Double {
++    var result = score
++    if (!song.liked && song.rating < 4) result *= NUDGE
++    if (song.plays > MANY_PLAYS) result *= NUDGE
++    if (song.lastPlayedAt != null && now - song.lastPlayedAt < FRESH_DAYS * DAY_MS) result *= NUDGE
++    if (song.artistKeys.any(disliked::contains)) result *= DISLIKED_ARTIST
++    if (favorites && (song.liked || song.rating >= 4)) result *= FAVORITE_BOOST
++    return result
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSettings.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSettings.kt
+new file mode 100644
+index 00000000..6270c787
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSettings.kt
+@@ -0,0 +1,28 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo.radio
++
++import android.content.Context
++
++/** Fork (Octo): how the user tuned radio, kept as the names of the choices so a renamed one falls back to the default. */
++object RadioSettings {
++    private const val FILE = "octo_radio"
++
++    fun parse(discovery: String?, adventure: String?, variety: String?, favorites: Boolean) = RadioTuning(
++        discovery = RadioDiscovery.entries.firstOrNull { it.name == discovery } ?: RadioDiscovery.Balanced,
++        adventure = RadioAdventure.entries.firstOrNull { it.name == adventure } ?: RadioAdventure.Balanced,
++        variety = RadioVariety.entries.firstOrNull { it.name == variety } ?: RadioVariety.Normal,
++        favorites = favorites,
++    )
++
++    fun load(context: Context): RadioTuning {
++        val p = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++        return parse(p.getString("discovery", null), p.getString("adventure", null), p.getString("variety", null), p.getBoolean("favorites", false))
++    }
++
++    fun save(context: Context, tuning: RadioTuning) {
++        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
++            .putString("discovery", tuning.discovery.name).putString("adventure", tuning.adventure.name)
++            .putString("variety", tuning.variety.name).putBoolean("favorites", tuning.favorites).apply()
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSong.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSong.kt
+new file mode 100644
+index 00000000..5cd333af
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioSong.kt
+@@ -0,0 +1,47 @@
++// SPDX-FileCopyrightText: 2024-2026 winters27 <https://github.com/winters27/octo-player>
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Ported from octo-player (shared/core/.../radio/RadioSong.kt); the title and artist readings are a smaller version
++// of Octo's SongIdentity, enough for the radio's spacing.
++package chromahub.rhythm.app.features.octo.radio
++
++import java.text.Normalizer
++
++// A song as the radio sees it.
++data class RadioSong(
++    val id: String,
++    val title: String,
++    val artists: List<String>,
++    val album: String? = null,
++    val genres: List<String> = emptyList(),
++    val year: Int? = null,
++    val durationMs: Long = 0,
++    val composers: List<String> = emptyList(),
++    val liked: Boolean = false,
++    val rating: Int = 0,
++    val plays: Long = 0,
++    val lastPlayedAt: Long? = null,
++) {
++    // What the radio compares songs by, worked out when first needed.
++    internal val artistKeys: Set<String> by lazy { artists.mapNotNullTo(LinkedHashSet(), ::artistKey) }
++    internal val composerKeys: Set<String> by lazy { composers.mapNotNullTo(LinkedHashSet(), ::artistKey) }
++    internal val genreKeys: List<String> by lazy { genres.map(::searchKey).filter(String::isNotEmpty).distinct() }
++    internal val titleKey: String by lazy { searchKey(titleCore(title)) }
++}
++
++private val marks = Regex("\\p{M}+")
++
++// For matching what someone types: lowercase, accents gone.
++fun searchKey(text: String): String =
++    marks.replace(Normalizer.normalize(text.trim(), Normalizer.Form.NFD), "").lowercase()
++
++private val creditSplit = Regex("""\s+(?:feat\.?|ft\.?|featuring|with|x|&)\s+|\s*[,;/]\s*""", RegexOption.IGNORE_CASE)
++
++// One spelling per artist: the main name of a credit, lowercase, accents gone.
++internal fun artistKey(name: String): String? =
++    searchKey(name.split(creditSplit).first()).takeIf(String::isNotEmpty)
++
++private val bracketed = Regex("""\s*[(\[][^)\]]*[)\]]""")
++private val dashSuffix = Regex("""\s+-\s+.*$""")
++
++// A title without its version marks: "Song (Live)" and "Song - Remastered 2011" are one title.
++internal fun titleCore(title: String): String = title.replace(bracketed, "").replace(dashSuffix, "").trim().ifEmpty { title }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuning.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuning.kt
+new file mode 100644
+index 00000000..1eca1cca
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuning.kt
+@@ -0,0 +1,59 @@
++// SPDX-FileCopyrightText: 2024-2026 winters27 <https://github.com/winters27/octo-player>
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Ported from octo-player (shared/core/.../radio) so Rhythm mixes Octo radio the way Octo's own apps do.
++
++package chromahub.rhythm.app.features.octo.radio
++
++
++// How a listener tunes Octo's radio: how much of it is music from outside
++// the library, how far it strays from the seeds, how soon an artist or an
++// album comes back, and whether favorites come around more often. Each app
++// keeps these in its own settings. The defaults play as radio always has,
++// apart from where the outside songs land.
++data class RadioTuning(
++    val discovery: RadioDiscovery = RadioDiscovery.Balanced,
++    val adventure: RadioAdventure = RadioAdventure.Balanced,
++    val variety: RadioVariety = RadioVariety.Normal,
++    val favorites: Boolean = false,
++) {
++    // How many songs to ask the server for: more when most of the radio is
++    // to come from outside the library, so the share can be reached.
++    val suggestions: Int get() = if (discovery.share > 0.5) 100 else 50
++}
++
++// The share of a radio kept for songs the library does not have, from the
++// server's suggestions. Balanced is the share Octo's Your Radio keeps.
++enum class RadioDiscovery(val share: Double, val label: String, val detail: String) {
++    LibraryOnly(0.0, "Only my library", "Never a song from outside your library"),
++    ALittle(0.15, "A little", "About 1 song in 7 from outside your library"),
++    Balanced(0.35, "Balanced", "About 1 song in 3 from outside your library"),
++    Lots(0.6, "Lots", "About 3 songs in 5 from outside your library"),
++    MostlyNew(0.85, "Mostly new", "About 5 songs in 6 from outside your library"),
++}
++
++// How far down the best matches a pick may land, as a share of their total
++// weight, and how many of the library's matches stay in the running.
++enum class RadioAdventure(val reach: Double, val keep: Double, val label: String, val detail: String) {
++    Focused(0.2, 0.5, "Focused", "Only the closest matches"),
++    Balanced(0.5, 1.0, "Balanced", "Close matches, with some surprises"),
++    Wander(1.0, 2.0, "Wander", "Deep cuts and further afield"),
++}
++
++// How far apart an album and an artist play, against the usual spacing,
++// which grows with the library. Another version of the same song always
++// waits the usual spacing.
++enum class RadioVariety(val scale: Double, val label: String, val detail: String) {
++    Tight(0.5, "Tight", "Artists and albums come back sooner"),
++    Normal(1.0, "Normal", "Spaced to suit your library's size"),
++    Wide(1.6, "Wide", "Artists and albums come back much later"),
++}
++
++// Radio mixed from your music, as Settings names it.
++const val SONG_RADIO = "Song radio"
++
++// What the Song radio part of Settings is, in a line.
++const val SONG_RADIO_ABOUT = "Radio started from a song, album or artist, and Autoplay when the queue ends, mixed from your music."
++
++// What the Live radio part of Settings is, in a line.
++const val LIVE_RADIO_ABOUT = "Stations on the air: the ones your server keeps, and ones near you."
++
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuningDialog.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuningDialog.kt
+new file mode 100644
+index 00000000..42a67bcb
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/RadioTuningDialog.kt
+@@ -0,0 +1,71 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo.radio
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.FilterChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++
++/** Fork (Octo): the radio's four dials, as in Octo's apps; saved the moment a choice is made. */
++@Composable
++fun RadioTuningDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    var tuning by remember { mutableStateOf(RadioSettings.load(context)) }
++    fun change(next: RadioTuning) { tuning = next; RadioSettings.save(context, next) }
++
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
++        title = { Text("Radio tuning") },
++        text = {
++            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
++                Dial("Music from outside your library", tuning.discovery.detail) {
++                    RadioDiscovery.entries.forEach { o -> Chip(o.label, o == tuning.discovery) { change(tuning.copy(discovery = o)) } }
++                }
++                Dial("How far it strays", tuning.adventure.detail) {
++                    RadioAdventure.entries.forEach { o -> Chip(o.label, o == tuning.adventure) { change(tuning.copy(adventure = o)) } }
++                }
++                Dial("How soon artists come back", tuning.variety.detail) {
++                    RadioVariety.entries.forEach { o -> Chip(o.label, o == tuning.variety) { change(tuning.copy(variety = o)) } }
++                }
++                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
++                    Text("Favorites more often")
++                    Switch(checked = tuning.favorites, onCheckedChange = { change(tuning.copy(favorites = it)) })
++                }
++            }
++        },
++    )
++}
++
++@Composable
++private fun Dial(title: String, detail: String, chips: @Composable () -> Unit) {
++    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++        Text(title, fontWeight = FontWeight.SemiBold)
++        Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) { chips() }
++    }
++}
++
++@Composable
++private fun Chip(label: String, selected: Boolean, onClick: () -> Unit) =
++    FilterChip(selected = selected, onClick = onClick, label = { Text(label) }, modifier = Modifier.padding(vertical = 2.dp))
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/radio/StreamingRadio.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/StreamingRadio.kt
+new file mode 100644
+index 00000000..2f683a2f
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/radio/StreamingRadio.kt
+@@ -0,0 +1,49 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo.radio
++
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingSong
++import kotlin.random.Random
++
++/** Fork (Octo): Start radio, mixed from the library and the server's suggestions the way Octo's apps do it. */
++object StreamingRadio {
++    fun radioSong(song: StreamingSong, liked: Boolean) = RadioSong(
++        id = song.id,
++        title = song.title,
++        artists = song.artistRefs.map { it.name }.filter { it.isNotBlank() }
++            .ifEmpty { listOf(song.displayArtist ?: song.artist).filter { it.isNotBlank() } },
++        album = song.albumId ?: song.album,
++        genres = listOfNotNull(song.genre?.trim()?.takeIf { it.isNotEmpty() }),
++        year = song.year,
++        durationMs = song.duration,
++        liked = liked,
++    )
++
++    /** The seed first, then up to [size] - 1 songs like it. Empty when nothing fits; the caller falls back. */
++    fun build(
++        seed: StreamingSong,
++        library: List<StreamingSong>,
++        related: List<StreamingSong>,
++        likedIds: Set<String>,
++        tuning: RadioTuning,
++        now: Long,
++        size: Int = 50,
++        random: Random = Random.Default,
++    ): List<StreamingSong> {
++        val byId = HashMap<String, StreamingSong>()
++        (library + related).forEach { byId.putIfAbsent(it.id, it) }
++        val mixed = radioMix(
++            RadioInput(
++                seeds = listOf(radioSong(seed, seed.id in likedIds)),
++                library = library.map { radioSong(it, it.id in likedIds) },
++                suggested = related.map { radioSong(it, it.id in likedIds) },
++                now = now,
++                tuning = tuning,
++            ),
++            count = size - 1,
++            random = random,
++        )
++        val songs = mixed.mapNotNull { byId[it.id] }
++        return if (songs.isEmpty()) emptyList() else listOf(seed) + songs
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+index 0b590005..4c4d3295 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/streaming/presentation/viewmodel/StreamingMusicViewModel.kt
+@@ -1680,7 +1680,14 @@ class StreamingMusicViewModel(application: Application) : AndroidViewModel(appli
+                 showToast("No radio for this song")
+                 return@launch
+             }
+-            playQueue(chromahub.rhythm.app.features.octo.RadioQueue.build(seed, related, { it.id }), 0)
++            val tuning = chromahub.rhythm.app.features.octo.radio.RadioSettings.load(getApplication())
++            val mixed = withContext(Dispatchers.Default) {
++                chromahub.rhythm.app.features.octo.radio.StreamingRadio.build(
++                    seed, _allSongs.value, related, _likedSongs.value.mapTo(HashSet()) { it.id }, tuning, System.currentTimeMillis(),
++                )
++            }
++            // A seed the mixer can place nothing against (no genre, no suggestions) still gets the server's suggestions.
++            playQueue(mixed.ifEmpty { chromahub.rhythm.app.features.octo.RadioQueue.build(seed, related, { it.id }) }, 0)
+         }
+     }
+ 
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/radio/RadioMixTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/radio/RadioMixTest.kt
+new file mode 100644
+index 00000000..9458fbce
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/radio/RadioMixTest.kt
+@@ -0,0 +1,357 @@
++// SPDX-FileCopyrightText: 2024-2026 winters27 <https://github.com/winters27/octo-player>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo.radio
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class RadioMixTest {
++    private val now = 1_800_000_000_000L
++    private val day = 86_400_000L
++
++    private fun song(
++        id: String,
++        artist: String,
++        genre: String = "Rock",
++        year: Int? = 1995,
++        album: String? = "al-$id",
++        rating: Int = 0,
++        lastPlayedAt: Long? = null,
++        title: String = id,
++        ms: Long = 200_000,
++    ) = RadioSong(id, title, listOf(artist), album, listOf(genre), year, ms, rating = rating, lastPlayedAt = lastPlayedAt)
++
++    private fun mix(
++        seeds: List<RadioSong>,
++        library: List<RadioSong>,
++        count: Int,
++        seed: Int = 1,
++        suggested: List<RadioSong> = emptyList(),
++        before: List<RadioSong> = emptyList(),
++        tuning: RadioTuning = RadioTuning(),
++    ) = radioMix(RadioInput(seeds, library, suggested, before, now = now, tuning = tuning), count, Random(seed)).map { it.id }
++
++    @Test
++    fun aSongMustShareAGenreWithTheSeeds() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("rock", "B"), song("jazz", "A", genre = "Jazz"))
++        assertEquals(listOf("rock"), mix(listOf(seed), library, 5))
++    }
++
++    @Test
++    fun theRightEraBeatsAFavoriteFromAnotherEra() {
++        // Songs from the seed's era that are not favorites, against
++        // favorites from twenty years on: the era wins every time, with
++        // favorites asked for more often too. Ten of them, so a draw can
++        // never walk past the last one into the other era (half the total
++        // weight is always inside the ten).
++        val seed = song("seed", "A", year = 1995)
++        val near = (1..10).map { song("near$it", "N$it", year = 1994 + it % 3) }
++        val far = (1..6).map { song("far$it", "F$it", year = 2014 + it).copy(liked = true) }
++        listOf(RadioTuning(), RadioTuning(favorites = true)).forEach { tuning ->
++            repeat(50) { run ->
++                val picks = mix(listOf(seed), listOf(seed) + near + far, 3, seed = run, tuning = tuning)
++                assertTrue("$tuning $picks", picks.all { it.startsWith("near") })
++            }
++        }
++    }
++
++    @Test
++    fun songsHeardLatelyComeOnlyWhenNothingElseIs() {
++        // The song heard two days ago is by far the better match (same artist,
++        // same era, a favourite), so only the wait can put the other first.
++        val seed = song("seed", "A")
++        val heard = song("heard", "A", lastPlayedAt = now - 2 * day).copy(liked = true)
++        val fresh = song("fresh", "B", year = 2015, lastPlayedAt = now - 20 * day)
++        val library = listOf(seed, fresh, heard)
++        repeat(20) { run ->
++            assertEquals(listOf("fresh"), mix(listOf(seed), library, 1, seed = run))
++            assertEquals(listOf("fresh", "heard"), mix(listOf(seed), library, 2, seed = run))
++        }
++    }
++
++    @Test
++    fun aOneStarSongNeverPlays() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("bad", "B", rating = 1), song("ok", "C"))
++        repeat(50) { assertFalse("bad" in mix(listOf(seed), library, 5, seed = it)) }
++    }
++
++    @Test
++    fun fillerNeverPlays() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("skit", "B", title = "Skit", ms = 40_000), song("ok", "C"))
++        assertEquals(listOf("ok"), mix(listOf(seed), library, 5))
++    }
++
++    @Test
++    fun anArtistWaitsItsTurn() {
++        // Five artists, one of them with five songs: the first five picks are
++        // by five different artists, whatever the draw.
++        val seed = song("seed", "A")
++        val library = listOf(seed) + (1..5).map { song("a$it", "A") } + listOf("B", "C", "D", "E").map { song("x$it", it) }
++        repeat(50) { run ->
++            val picks = radioMix(RadioInput(listOf(seed), library, now = now), 5, Random(run))
++            assertEquals(5, picks.map { it.artists }.distinct().size)
++        }
++    }
++
++    @Test
++    fun twoArtistsTakeTurns() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("a1", "A"), song("a2", "A"), song("b1", "B"))
++        repeat(20) { run ->
++            val picks = radioMix(RadioInput(listOf(seed), library, now = now), 3, Random(run))
++            assertEquals(listOf("A", "B", "A"), picks.map { it.artists.single() })
++        }
++    }
++
++    @Test
++    fun aSmallLibraryStillFillsTheCount() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("a1", "A", album = "one"), song("a2", "A", album = "one"), song("a3", "A", album = "one"))
++        assertEquals(3, mix(listOf(seed), library, 3).size)
++    }
++
++    @Test
++    fun theServersSuggestionsCountWithoutAGenre() {
++        val seed = song("seed", "A", genre = "")
++        val suggested = listOf(song("s1", "B", genre = ""), song("s2", "C", genre = ""))
++        assertEquals(setOf("s1", "s2"), mix(listOf(seed), listOf(seed), 5, suggested = suggested).toSet())
++    }
++
++    // A library of close matches and as many suggestions the library does
++    // not have, which carry no genre or year, so nothing but the placement
++    // decides which kind plays where. "O" is a song from outside, "L" one
++    // from the library.
++    private val seedSong = song("seed", "A")
++    private val plenty = listOf(seedSong) + (1..60).map { song("lib$it", "L$it") }
++    private val found = (1..60).map { song("new$it", "S$it", genre = "", year = null) }
++
++    private fun kinds(tuning: RadioTuning = RadioTuning(), runs: Int = 200, count: Int = 30): List<String> =
++        (0 until runs).map { run ->
++            mix(listOf(seedSong), plenty, count, seed = run, suggested = found, tuning = tuning)
++                .joinToString("") { if (it.startsWith("new")) "O" else "L" }
++        }
++
++    @Test
++    fun outsideSongsLandAtRandomNotEveryThirdSong() {
++        val openings = kinds().map { it.take(9) }
++        assertTrue(openings.toSet().size.toString(), openings.toSet().size >= 20)
++        assertTrue(openings.count { it == "LLOLLOLLO" } < 10)
++    }
++
++    @Test
++    fun theShareHoldsAcrossRadios() {
++        val radios = kinds()
++        radios.forEach { assertEquals(30, it.length) }
++        assertTrue(radios.toString(), radios.all { it.count { kind -> kind == 'O' } in 8..13 })
++        val share = radios.sumOf { it.count { kind -> kind == 'O' } } / (30.0 * radios.size)
++        assertTrue(share.toString(), share in 0.33..0.37)
++    }
++
++    @Test
++    fun neverThreeOutsideSongsInARow() {
++        assertTrue(kinds().none { "OOO" in it })
++    }
++
++    @Test
++    fun mostlyNewNeverPlaysThreeLibrarySongsInARow() {
++        val radios = kinds(RadioTuning(discovery = RadioDiscovery.MostlyNew))
++        assertTrue(radios.none { "LLL" in it })
++        val share = radios.sumOf { it.count { kind -> kind == 'O' } } / (30.0 * radios.size)
++        assertTrue(share.toString(), share in 0.82..0.88)
++    }
++
++    @Test
++    fun eachDiscoveryLevelKeepsItsShare() {
++        listOf(RadioDiscovery.ALittle, RadioDiscovery.Lots).forEach { level ->
++            val radios = kinds(RadioTuning(discovery = level), runs = 100)
++            val share = radios.sumOf { it.count { kind -> kind == 'O' } } / (30.0 * radios.size)
++            assertTrue("$level $share", share in level.share - 0.03..level.share + 0.03)
++        }
++    }
++
++    @Test
++    fun onlyMyLibraryNeverPlaysAnOutsideSong() {
++        val library = listOf(seedSong, song("a", "B"), song("b", "C"), song("c", "D"))
++        val picks = mix(listOf(seedSong), library, 10, suggested = found, tuning = RadioTuning(discovery = RadioDiscovery.LibraryOnly))
++        assertEquals(setOf("a", "b", "c"), picks.toSet())
++        assertEquals(3, picks.size)
++    }
++
++    @Test
++    fun aShareTheOutsideSongsCannotReachEndsWithoutABlockOfLibrarySongs() {
++        // Mostly new, with only 35 outside songs for a radio of 50: the share
++        // is paced to what there is, so the library songs are spread through
++        // instead of all coming at the end.
++        val few = found.take(35)
++        val radios = (0 until 200).map { run ->
++            mix(listOf(seedSong), plenty, 50, seed = run, suggested = few, tuning = RadioTuning(discovery = RadioDiscovery.MostlyNew))
++                .joinToString("") { if (it.startsWith("new")) "O" else "L" }
++        }
++        assertTrue(radios.filter { "LLL" in it }.toString(), radios.none { "LLL" in it })
++        assertTrue(radios.all { it.count { kind -> kind == 'O' } >= 33 })
++    }
++
++    @Test
++    fun pacedShareFollowsWhatThereIs() {
++        assertEquals(0.35, pacedShare(0.35, 60, 60, 30), 1e-9)
++        // Too few outside songs: as many as there are.
++        assertEquals(0.7, pacedShare(0.85, 35, 400, 50), 1e-9)
++        // Too few library songs: the outside ones fill the rest.
++        assertEquals(0.8, pacedShare(0.35, 100, 10, 50), 1e-9)
++        // Fewer songs than slots: the mix they make.
++        assertEquals(0.25, pacedShare(0.85, 5, 15, 50), 1e-9)
++        assertEquals(0.35, pacedShare(0.35, 0, 0, 50), 1e-9)
++    }
++
++    @Test
++    fun theRunCapHoldsWhereverADrawLands() {
++        // Wander lets a draw land at the end of a list; when the songs there
++        // are taken it goes on from the top instead of giving the slot away.
++        listOf(RadioAdventure.Focused, RadioAdventure.Balanced, RadioAdventure.Wander).forEach { adventure ->
++            val balanced = kinds(RadioTuning(adventure = adventure), runs = 300)
++            assertTrue("$adventure ${balanced.filter { "OOO" in it }}", balanced.none { "OOO" in it })
++            val lots = kinds(RadioTuning(discovery = RadioDiscovery.Lots, adventure = adventure), runs = 300)
++            assertTrue("$adventure ${lots.filter { "LLL" in it }}", lots.none { "LLL" in it })
++        }
++    }
++
++    @Test
++    fun theRunCarriesOnFromTheSongsBefore() {
++        // Two songs from outside the library just played (the end of the
++        // last Autoplay batch): the next pick is the library's.
++        val before = listOf(song("x1", "X1", genre = "", year = null), song("x2", "X2", genre = "", year = null))
++        repeat(200) { run ->
++            val first = mix(listOf(seedSong), plenty, 1, seed = run, suggested = found, before = before).single()
++            assertTrue(first, first.startsWith("lib"))
++        }
++        // The phone names the kinds itself, since its `before` holds only
++        // library songs.
++        repeat(200) { run ->
++            val first = radioMix(
++                RadioInput(listOf(seedSong), plenty, found, now = now, beforeOutside = listOf(false, true, true)), 1, Random(run),
++            ).single().id
++            assertTrue(first, first.startsWith("lib"))
++        }
++        assertEquals(2, runOf(listOf(false, true, true)))
++        assertEquals(-1, runOf(listOf(true, false)))
++        assertEquals(0, runOf(emptyList()))
++    }
++
++    @Test
++    fun tightVarietyStillSpacesOtherVersionsOfASong() {
++        // Twelve songs in four versions each, every version by its own artist
++        // on its own album: Tight brings artists back sooner, never the same
++        // song in another version.
++        val seed = song("seed", "Z")
++        val library = listOf(seed) + (1..12).flatMap { t -> (1..4).map { v -> song("t$t-$v", "Artist $t-$v", title = "Title $t") } }
++        repeat(100) { run ->
++            val titles = radioMix(
++                RadioInput(listOf(seed), library, now = now, tuning = RadioTuning(variety = RadioVariety.Tight)), 20, Random(run),
++            ).map { it.title }
++            val close = titles.indices.any { i -> (1..8).any { d -> i + d < titles.size && titles[i] == titles[i + d] } }
++            assertFalse(titles.toString(), close)
++        }
++    }
++
++    @Test
++    fun focusedStillDrawsFromMoreThanAHandful() {
++        // Three hundred songs alike: Focused keeps to the best of them, but
++        // from the usual two hundred, not a smaller pool.
++        val seed = song("seed", "Z")
++        val library = listOf(seed) + (1..300).map { song("s$it", "S$it") }
++        val picked = (0 until 100).flatMapTo(HashSet()) { run ->
++            radioMix(RadioInput(listOf(seed), library, now = now, tuning = RadioTuning(adventure = RadioAdventure.Focused)), 10, Random(run)).map { it.id }
++        }
++        assertTrue(picked.size.toString(), picked.size > 30)
++    }
++
++    @Test
++    fun outsideDueFollowsItsRules() {
++        val random = Random(1)
++        assertFalse(outsideDue(0.0, 5, 0, 0, random))
++        assertTrue(outsideDue(1.0, 5, 5, 3, random))
++        // Too far behind the share: outside, whatever the draw.
++        assertTrue(outsideDue(0.35, 4, 0, -4, random))
++        // Too far ahead of it: the library.
++        assertFalse(outsideDue(0.35, 2, 2, 2, random))
++        // Two outside in a row is the most under half; two library in a row over half.
++        assertFalse(outsideDue(0.35, 5, 2, 2, random))
++        assertTrue(outsideDue(0.85, 5, 5, -2, random))
++    }
++
++    @Test
++    fun focusedStaysCloserThanWander() {
++        // Forty songs a year apart from the seed's year on: the closer, the
++        // better the match.
++        val seed = song("seed", "A", year = 1995)
++        val library = listOf(seed) + (0 until 40).map { song("y$it", "Y$it", year = 1995 + it) }
++        fun distance(adventure: RadioAdventure): Double = (0 until 200).sumOf { run ->
++            radioMix(RadioInput(listOf(seed), library, now = now, tuning = RadioTuning(adventure = adventure)), 5, Random(run))
++                .sumOf { (it.year!! - 1995).toDouble() }
++        } / 1000.0
++        val focused = distance(RadioAdventure.Focused)
++        val balanced = distance(RadioAdventure.Balanced)
++        val wander = distance(RadioAdventure.Wander)
++        assertTrue("$focused $balanced $wander", focused < balanced && balanced < wander)
++    }
++
++    @Test
++    fun tightVarietyLetsAnArtistBackSooner() {
++        // Six artists with eight songs each. Normal spacing keeps an artist
++        // at least four picks apart; Tight lets one back after two others.
++        val seed = song("seed", "Z")
++        val library = listOf(seed) + (1..6).flatMap { a -> (1..8).map { song("a$a-$it", "Artist $a") } }
++        fun closeRepeats(variety: RadioVariety): Int = (0 until 100).count { run ->
++            val artists = radioMix(RadioInput(listOf(seed), library, now = now, tuning = RadioTuning(variety = variety)), 12, Random(run))
++                .map { it.artists.single() }
++            artists.indices.any { i -> (1..3).any { d -> i + d < artists.size && artists[i] == artists[i + d] } }
++        }
++        assertTrue(closeRepeats(RadioVariety.Tight) > 0)
++        assertEquals(0, closeRepeats(RadioVariety.Normal))
++    }
++
++    @Test
++    fun favoritesMoreOftenPlaysMoreFavorites() {
++        // The favorites are four years off the seed, so on merit they come
++        // just after the rest; asked for, they come first.
++        val seed = song("seed", "A", year = 1995)
++        val rest = (1..15).map { song("r$it", "R$it", year = 1995) }
++        val liked = (1..15).map { song("f$it", "F$it", year = 1999).copy(liked = true) }
++        val library = listOf(seed) + rest + liked
++        fun favorites(on: Boolean): Double = (0 until 200).sumOf { run ->
++            radioMix(RadioInput(listOf(seed), library, now = now, tuning = RadioTuning(favorites = on)), 10, Random(run))
++                .count { it.liked }.toDouble()
++        } / 200.0
++        val off = favorites(false)
++        val on = favorites(true)
++        assertTrue("$off $on", on >= off + 1.0)
++    }
++
++    @Test
++    fun theFirstSeedAndExcludedSongsAreNeverPicked() {
++        val seed = song("seed", "A")
++        val library = listOf(seed, song("x", "B"), song("y", "C"))
++        val picks = radioMix(RadioInput(listOf(seed), library, exclude = setOf("x"), now = now), 5, Random(3)).map { it.id }
++        assertEquals(listOf("y"), picks)
++    }
++
++    @Test
++    fun theSameDrawGivesTheSameMix() {
++        val seed = song("seed", "A")
++        val library = listOf(seed) + (1..30).map { song("s$it", "Artist ${it % 7}", year = 1990 + it % 10) }
++        assertEquals(mix(listOf(seed), library, 10, seed = 9), mix(listOf(seed), library, 10, seed = 9))
++    }
++
++    @Test
++    fun spacingGrowsWithTheLibrary() {
++        assertEquals(8, radioSpacing(0))
++        assertEquals(16, radioSpacing(60_000))
++        assertEquals(30, radioSpacing(1_000_000))
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/radio/StreamingRadioTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/radio/StreamingRadioTest.kt
+new file mode 100644
+index 00000000..95c34a1f
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/radio/StreamingRadioTest.kt
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo.radio
++
++import chromahub.rhythm.app.core.domain.model.SourceType
++import chromahub.rhythm.app.features.streaming.domain.model.StreamingSong
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class StreamingRadioTest {
++    private fun song(id: String, artist: String, genre: String = "Hip-Hop") = StreamingSong(
++        id = id, title = "t$id", artist = artist, album = "al$id", duration = 200_000L, artworkUri = null,
++        sourceType = SourceType.SUBSONIC, streamingUrl = null, previewUrl = null, genre = genre, year = 2010,
++    )
++
++    @Test
++    fun theSeedIsFirstAndEverySongIsOnlyOnce() {
++        val seed = song("seed", "A")
++        val library = listOf(seed) + (1..30).map { song("l$it", "B$it") }
++        val related = (1..30).map { song("r$it", "C$it") }
++        val out = StreamingRadio.build(seed, library, related, emptySet(), RadioTuning(), 1_800_000_000_000L, random = Random(3))
++        assertEquals("seed", out.first().id)
++        assertEquals(out.size, out.map { it.id }.toSet().size)
++        assertTrue(out.size in 2..50)
++    }
++
++    @Test
++    fun onlyMyLibraryNeverPlaysASongOutsideIt() {
++        val seed = song("seed", "A")
++        val library = listOf(seed) + (1..30).map { song("l$it", "B$it") }
++        val related = (1..30).map { song("r$it", "C$it") }
++        val out = StreamingRadio.build(seed, library, related, emptySet(), RadioTuning(discovery = RadioDiscovery.LibraryOnly), 1_800_000_000_000L, random = Random(5))
++        assertTrue(out.drop(1).all { it.id.startsWith("l") })
++    }
++
++    @Test
++    fun mostlyNewTakesMostOfTheRadioFromSuggestions() {
++        val seed = song("seed", "A")
++        val library = listOf(seed) + (1..60).map { song("l$it", "B$it") }
++        val related = (1..60).map { song("r$it", "C$it") }
++        val out = StreamingRadio.build(seed, library, related, emptySet(), RadioTuning(discovery = RadioDiscovery.MostlyNew), 1_800_000_000_000L, random = Random(7))
++        assertTrue(out.drop(1).count { it.id.startsWith("r") } > out.size / 2)
++    }
++
++    @Test
++    fun aSeedWithNothingToMatchGivesNoRadio() {
++        val seed = song("seed", "A", genre = "")
++        assertTrue(StreamingRadio.build(seed, listOf(seed), emptyList(), emptySet(), RadioTuning(), 1L).isEmpty())
++    }
++
++    @Test
++    fun settingsFallBackToTheDefaultsForUnknownNames() {
++        assertEquals(RadioTuning(), RadioSettings.parse("Gone", null, "Nope", false))
++        assertEquals(RadioDiscovery.Lots, RadioSettings.parse("Lots", null, null, false).discovery)
++        assertFalse(RadioSettings.parse(null, null, null, false).favorites)
++    }
++}
+-- 
+2.56.0
+
