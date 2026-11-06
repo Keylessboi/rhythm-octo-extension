@@ -1,0 +1,329 @@
+From 10efc3544c372a9de20f8d71e5e96f1ea99fda1b Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Fri, 6 Nov 2026 06:58:12 -0500
+Subject: [PATCH] feat(octo): imports card on Home (lists, fetch-missing
+ switch, add a link)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../local/presentation/screens/HomeScreen.kt  |   1 +
+ .../rhythm/app/features/octo/OctoClient.kt    |   8 ++
+ .../rhythm/app/features/octo/OctoImports.kt   |  83 +++++++++++++
+ .../app/features/octo/OctoImportsCard.kt      | 114 ++++++++++++++++++
+ .../features/octo/OctoImportParsersTest.kt    |  64 ++++++++++
+ 5 files changed, 270 insertions(+)
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoImports.kt
+ create mode 100644 app/src/main/java/chromahub/rhythm/app/features/octo/OctoImportsCard.kt
+ create mode 100644 app/src/test/java/chromahub/rhythm/app/features/octo/OctoImportParsersTest.kt
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+index 90b0a35a..6226802c 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/local/presentation/screens/HomeScreen.kt
+@@ -991,6 +991,7 @@ private fun StreamingHomeBody(
+         // Fork (Octo): what the Octo server is fetching for the user (features/octo); draws nothing elsewhere
+         if (hasConfiguredSession) chromahub.rhythm.app.features.octo.OctoRequestsCard(modifier = Modifier.padding(top = 12.dp))
+         if (hasConfiguredSession && streamingViewModel != null) chromahub.rhythm.app.features.octo.OctoStationsRow(streamingViewModel, Modifier.padding(top = 12.dp))
++        if (hasConfiguredSession) chromahub.rhythm.app.features.octo.OctoImportsCard(modifier = Modifier.padding(top = 12.dp))
+ 
+         val isTablet = widthSizeClass != WindowWidthSizeClass.Compact || windowScreenWidthDp() >= 600
+         val isLandscapeTablet = isTablet && windowScreenWidthDp() > windowScreenHeightDp()
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
+index 1f396748..27b0ea91 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoClient.kt
+@@ -41,4 +41,12 @@ class OctoClient(private val api: SubsonicApiClient) {
+         return api.call("pickFoundSong", mapOf("search" to search, which.first to which.second))
+             .map { OctoParsers.pick(it.getJSONObject("pick")) }
+     }
++
++    /** The signed-in user's imported lists and the trickle that fetches what the library lacks. Needs octoImports. */
++    suspend fun imports(): Result<ImportsOverview> =
++        api.call("getImports").map { OctoImportParsers.overview(it.getJSONObject("imports")) }
++
++    /** One import action (addLink, fetch, playlist, remove, refresh...); the answer is the server's, in its own words. */
++    suspend fun importAction(action: String, params: Map<String, String> = emptyMap()): Result<ImportAnswer> =
++        api.call("importAction", mapOf("action" to action) + params).map { OctoImportParsers.answer(it.getJSONObject("importAction")) }
+ }
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImports.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImports.kt
+new file mode 100644
+index 00000000..1512d140
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImports.kt
+@@ -0,0 +1,83 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** One imported list (a Spotify playlist, a link, a file) and how much of it the library already has. */
++data class ImportList(
++    val id: String,
++    val name: String,
++    val source: String,
++    val total: Int,
++    val have: Int,
++    val missing: Int,
++    val queued: Int,
++    val downloading: Int,
++    val getMissing: Boolean,
++    val keepPlaylist: Boolean,
++) {
++    /** How much of it the library has, 0 to 1. */
++    val fraction: Float get() = if (total <= 0) 0f else (have.toFloat() / total).coerceIn(0f, 1f)
++
++    /** Songs on their way: waiting in the trickle or being fetched. */
++    val coming: Int get() = queued + downloading
++
++    /** A list read through a Spotify account sign-in: it stays as it was last read. */
++    val fromSignIn: Boolean get() = source == "spotifyLiked" || source == "spotifyPlaylist"
++}
++
++data class ImportsOverview(
++    val lists: List<ImportList>,
++    val trickleState: String,
++    val trickleQueued: Int,
++    val current: String?,
++    val libraryProblem: String?,
++)
++
++data class ImportAnswer(val ok: Boolean, val message: String, val listId: String?)
++
++object OctoImportParsers {
++    private fun JSONObject.str(name: String): String? = if (isNull(name)) null else optString(name).takeIf { it.isNotBlank() }
++
++    private fun objects(value: Any?): List<JSONObject> = when (value) {
++        is JSONArray -> (0 until value.length()).mapNotNull { value.optJSONObject(it) }
++        is JSONObject -> listOf(value)
++        else -> emptyList()
++    }
++
++    fun overview(o: JSONObject): ImportsOverview {
++        val trickle = o.optJSONObject("trickle")
++        val current = trickle?.optJSONObject("current")
++        return ImportsOverview(
++            lists = objects(o.opt("lists")).map(::list),
++            trickleState = trickle?.optString("state").orEmpty(),
++            trickleQueued = trickle?.optInt("queued") ?: 0,
++            current = current?.let { "${it.optString("artist")} – ${it.optString("title")}" },
++            libraryProblem = o.str("libraryProblem"),
++        )
++    }
++
++    fun list(o: JSONObject) = ImportList(
++        id = o.optString("id"),
++        name = o.optString("name"),
++        source = o.optString("source"),
++        total = o.optInt("total"),
++        have = o.optInt("have"),
++        missing = o.optInt("missing"),
++        queued = o.optInt("queued"),
++        downloading = o.optInt("downloading"),
++        getMissing = o.optBoolean("getMissing"),
++        keepPlaylist = o.optBoolean("keepPlaylist"),
++    )
++
++    fun answer(o: JSONObject) = ImportAnswer(o.optBoolean("ok"), o.optString("message"), o.str("listId"))
++
++    /** One line for what the trickle is doing, in plain words. */
++    fun trickleLine(o: ImportsOverview): String? = when {
++        o.current != null -> "Fetching: ${o.current}"
++        o.trickleQueued > 0 -> "${o.trickleQueued} waiting to be fetched"
++        else -> null
++    }
++}
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImportsCard.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImportsCard.kt
+new file mode 100644
+index 00000000..b3aa3e29
+--- /dev/null
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoImportsCard.kt
+@@ -0,0 +1,114 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import android.widget.Toast
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import chromahub.rhythm.app.core.utils.NetworkUtils
++import chromahub.rhythm.app.shared.data.model.AppSettings
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++
++/** One line for a list: how much of it the library has, and what is on its way. */
++fun importListLine(l: ImportList): String =
++    "${l.have} of ${l.total} in your library" + (if (l.coming > 0) " · ${l.coming} coming" else "")
++
++/**
++ * Fork (Octo): the lists the user brought to Octo (a Spotify playlist, a link, a file) with how much of each the library
++ * has, a switch to fetch what is missing, and a way to add a link. Draws nothing on a plain Navidrome or when offline.
++ */
++@Composable
++fun OctoImportsCard(modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    val offlineMode by AppSettings.getInstance(context).offlineMode.collectAsState()
++    var overview by remember { mutableStateOf<ImportsOverview?>(null) }
++    var adding by remember { mutableStateOf(false) }
++    var link by remember { mutableStateOf("") }
++    val scope = rememberCoroutineScope()
++    val client = remember { OctoClient(context) }
++
++    LaunchedEffect(offlineMode) {
++        if (offlineMode || !NetworkUtils.isNetworkAvailable(context)) { overview = null; return@LaunchedEffect }
++        if (client.extensions().getOrNull()?.get(OCTO_IMPORTS) == null) return@LaunchedEffect
++        while (true) {
++            client.imports().onSuccess { overview = it }
++            delay(if (overview?.lists?.any { it.coming > 0 } == true) 10_000L else 60_000L)
++        }
++    }
++    val o = overview ?: return
++
++    fun act(action: String, params: Map<String, String>, then: () -> Unit = {}) = scope.launch {
++        client.importAction(action, params)
++            .onSuccess { a -> if (a.message.isNotBlank()) Toast.makeText(context, a.message, Toast.LENGTH_LONG).show(); then() }
++            .onFailure { Toast.makeText(context, it.message ?: "Octo did not answer", Toast.LENGTH_LONG).show() }
++        client.imports().onSuccess { overview = it }
++    }
++
++    Card(
++        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
++        shape = RoundedCornerShape(20.dp),
++        modifier = modifier.fillMaxWidth(),
++    ) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
++                Text("Your imports", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++                TextButton(onClick = { adding = true }) { Text("Add link") }
++            }
++            o.libraryProblem?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
++            if (o.lists.isEmpty()) Text("Nothing imported yet. Add a link to a public playlist or album.", style = MaterialTheme.typography.bodySmall)
++            o.lists.take(8).forEach { l ->
++                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
++                        Text(l.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
++                        Switch(checked = l.getMissing, onCheckedChange = { on -> act("fetch", mapOf("id" to l.id, "on" to on.toString())) })
++                    }
++                    Text(importListLine(l) + if (l.getMissing) "" else " · not fetching the rest", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
++                    LinearProgressIndicator(progress = { l.fraction }, modifier = Modifier.fillMaxWidth())
++                }
++            }
++            OctoImportParsers.trickleLine(o)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }
++        }
++    }
++
++    if (adding) {
++        AlertDialog(
++            onDismissRequest = { adding = false },
++            title = { Text("Add a link") },
++            text = {
++                OutlinedTextField(link, { link = it }, label = { Text("Public playlist or album link") }, singleLine = true, modifier = Modifier.fillMaxWidth())
++            },
++            confirmButton = {
++                TextButton(enabled = link.isNotBlank(), onClick = { act("addLink", mapOf("url" to link.trim())) { link = "" }; adding = false }) { Text("Add") }
++            },
++            dismissButton = { TextButton(onClick = { adding = false }) { Text("Cancel") } },
++        )
++    }
++}
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoImportParsersTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoImportParsersTest.kt
+new file mode 100644
+index 00000000..5ad625a4
+--- /dev/null
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoImportParsersTest.kt
+@@ -0,0 +1,64 @@
++// SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
++// SPDX-License-Identifier: GPL-3.0-or-later
++package chromahub.rhythm.app.features.octo
++
++import org.json.JSONObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class OctoImportParsersTest {
++    private val overview = JSONObject(
++        """{"lists":[{"id":"spotify-liked","name":"Liked Songs","source":"spotifyLiked","total":10,"have":6,"missing":2,"queued":1,
++        "downloading":1,"keepPlaylist":false,"getMissing":true,"canRefresh":true,"newField":1},
++        {"id":"t1","name":"Gym","source":"textList"}],
++        "trickle":{"state":"waitingForSoulseek","perHour":20,"queued":1,"current":{"key":"spotify:a","title":"Angel","artist":"Massive Attack","state":"downloading","progress":0.4}},
++        "libraryProblem":null}""",
++    )
++
++    @Test
++    fun readsTheListsAndHowMuchOfEachTheLibraryHas() {
++        val o = OctoImportParsers.overview(overview)
++        val liked = o.lists.first()
++        assertEquals("Liked Songs", liked.name)
++        assertEquals(0.6f, liked.fraction, 0.001f)
++        assertEquals(2, liked.coming)
++        assertTrue(liked.getMissing)
++        assertTrue(liked.fromSignIn)
++        assertFalse(o.lists[1].fromSignIn)
++        assertEquals(0f, o.lists[1].fraction, 0f)
++    }
++
++    @Test
++    fun readsWhatTheTrickleIsDoing() {
++        val o = OctoImportParsers.overview(overview)
++        assertEquals("Fetching: Massive Attack – Angel", OctoImportParsers.trickleLine(o))
++        assertNull(o.libraryProblem)
++    }
++
++    @Test
++    fun aSingleListIsAnObjectNotAnArray() {
++        val o = OctoImportParsers.overview(JSONObject("""{"lists":{"id":"a","name":"Only","total":3,"have":3}}"""))
++        assertEquals(listOf("Only"), o.lists.map { it.name })
++    }
++
++    @Test
++    fun anAnswerCarriesTheServersWordsAndTheListItBecame() {
++        val a = OctoImportParsers.answer(JSONObject("""{"ok":false,"message":"That link is not a public playlist or album."}"""))
++        assertFalse(a.ok)
++        assertEquals("That link is not a public playlist or album.", a.message)
++        assertNull(a.listId)
++        assertEquals("f1", OctoImportParsers.answer(JSONObject("""{"ok":true,"listId":"f1","count":12}""")).listId)
++    }
++}
++
++class ImportListLineTest {
++    @Test
++    fun aListSaysHowMuchIsInTheLibraryAndWhatIsComing() {
++        val l = OctoImportParsers.list(JSONObject("""{"id":"a","name":"X","total":10,"have":6,"queued":1,"downloading":1}"""))
++        org.junit.Assert.assertEquals("6 of 10 in your library · 2 coming", importListLine(l))
++        org.junit.Assert.assertEquals("3 of 3 in your library", importListLine(l.copy(total = 3, have = 3, queued = 0, downloading = 0)))
++    }
++}
+-- 
+2.56.0
+

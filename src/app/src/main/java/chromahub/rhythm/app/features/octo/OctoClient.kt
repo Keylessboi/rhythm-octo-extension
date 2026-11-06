@@ -41,4 +41,12 @@ class OctoClient(private val api: SubsonicApiClient) {
         return api.call("pickFoundSong", mapOf("search" to search, which.first to which.second))
             .map { OctoParsers.pick(it.getJSONObject("pick")) }
     }
+
+    /** The signed-in user's imported lists and the trickle that fetches what the library lacks. Needs octoImports. */
+    suspend fun imports(): Result<ImportsOverview> =
+        api.call("getImports").map { OctoImportParsers.overview(it.getJSONObject("imports")) }
+
+    /** One import action (addLink, fetch, playlist, remove, refresh...); the answer is the server's, in its own words. */
+    suspend fun importAction(action: String, params: Map<String, String> = emptyMap()): Result<ImportAnswer> =
+        api.call("importAction", mapOf("action" to action) + params).map { OctoImportParsers.answer(it.getJSONObject("importAction")) }
 }
