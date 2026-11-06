@@ -8,7 +8,7 @@ import org.junit.Test
 class OctoSearchLabelTest {
     @Test
     fun aPreviewIsLabelledNotInLibrary() =
-        assertEquals("Kanye West • Graduation • Not in library", OctoSearchLabel.subtitle("Kanye West", "Graduation", true, "Not in library"))
+        assertEquals("Not in library • Kanye West • Graduation", OctoSearchLabel.subtitle("Kanye West", "Graduation", true, "Not in library"))
 
     @Test
     fun anOwnedSongKeepsItsPlainSubtitle() =

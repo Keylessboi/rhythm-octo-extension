@@ -1,0 +1,41 @@
+From 872055b3d1cbbce21293e2fdc69962cee265958f Mon Sep 17 00:00:00 2001
+From: Travis Fiorito <travis@sandstorm.chat>
+Date: Fri, 6 Nov 2026 07:04:26 -0500
+Subject: [PATCH] fix(octo): put Not in library first so a long album name
+ cannot hide it
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt | 3 ++-
+ .../chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt  | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
+index 953be439..7d16041b 100644
+--- a/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
++++ b/app/src/main/java/chromahub/rhythm/app/features/octo/OctoSearchLabel.kt
+@@ -6,6 +6,7 @@ package chromahub.rhythm.app.features.octo
+ object OctoSearchLabel {
+     fun subtitle(artist: String, album: String, isExternal: Boolean, notInLibrary: String): String {
+         val base = "$artist • $album"
+-        return if (isExternal) "$base • $notInLibrary" else base
++        // First, so a long album name cannot push it off the row.
++        return if (isExternal) "$notInLibrary • $base" else base
+     }
+ }
+diff --git a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
+index 12b2b458..96a6daa8 100644
+--- a/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
++++ b/app/src/test/java/chromahub/rhythm/app/features/octo/OctoSearchLabelTest.kt
+@@ -8,7 +8,7 @@ import org.junit.Test
+ class OctoSearchLabelTest {
+     @Test
+     fun aPreviewIsLabelledNotInLibrary() =
+-        assertEquals("Kanye West • Graduation • Not in library", OctoSearchLabel.subtitle("Kanye West", "Graduation", true, "Not in library"))
++        assertEquals("Not in library • Kanye West • Graduation", OctoSearchLabel.subtitle("Kanye West", "Graduation", true, "Not in library"))
+ 
+     @Test
+     fun anOwnedSongKeepsItsPlainSubtitle() =
+-- 
+2.56.0
+

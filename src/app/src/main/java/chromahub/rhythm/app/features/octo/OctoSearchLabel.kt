@@ -6,6 +6,7 @@ package chromahub.rhythm.app.features.octo
 object OctoSearchLabel {
     fun subtitle(artist: String, album: String, isExternal: Boolean, notInLibrary: String): String {
         val base = "$artist • $album"
-        return if (isExternal) "$base • $notInLibrary" else base
+        // First, so a long album name cannot push it off the row.
+        return if (isExternal) "$notInLibrary • $base" else base
     }
 }
